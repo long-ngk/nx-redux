@@ -1,0 +1,257 @@
+#!/bin/sh
+#
+# Find a usable Python, then run the app.
+#
+# The Brick ships python3 in its firmware. The Brick Pro (TG4040) ships none at
+# all - not in the rootfs, not on the card, no busybox applet - so a fixed
+# `python3 app.py` died there with "python3: not found" and the menu just
+# bounced back, showing nothing. Every layer below exists because one of them
+# can be missing on some device:
+#
+#   1. the device's own python3
+#   2. the interpreter bundled with this install, under python/
+#   3. one left by an earlier run of this script, or by PortMaster
+#   4. failing all that, download it
+#
+# Nothing here may assume Python exists: this script is the one part of RetroHub
+# that runs before it.
+
+# Parameter expansion, not dirname: this script runs before anything else is
+# known to exist, and one less external command is one less way to fail.
+case "$0" in
+    */*) cd "${0%/*}" || exit 1 ;;
+esac
+APP="$(pwd)"
+
+# NX Redux (skeleton/SYSTEM/<plat>/paks/MinUI.pak/launch.sh) exports all of
+# these before it execs a pak's launch.sh, so the values below are only reached
+# when this same script is run under stock firmware or copied out to Apps/ on
+# its own. Keep the fallbacks byte-compatible with what MinUI.pak/launch.sh
+# really sets - rh/ledctl.py reads USERDATA_PATH and rh/paths.py reads
+# PLATFORM, so a drifted default would silently change where RetroHub looks for
+# them.
+export SDCARD_PATH="${SDCARD_PATH:-/mnt/SDCARD}"
+export PLATFORM="${PLATFORM:-tg5040}"
+export SYSTEM_PATH="${SYSTEM_PATH:-$SDCARD_PATH/.system}"
+export USERDATA_PATH="${USERDATA_PATH:-$SDCARD_PATH/.userdata/$PLATFORM}"
+export LOGS_PATH="${LOGS_PATH:-$USERDATA_PATH/logs}"
+export SHARED_SYSTEM_PATH="${SHARED_SYSTEM_PATH:-$SDCARD_PATH/.system/shared}"
+export HOME="${HOME:-$USERDATA_PATH}"
+export DEVICE="${DEVICE:-brickpro}"
+
+# NX Redux puts its own bin dirs first; $SDCARD_PATH/System/bin stays in the
+# mix for the stock-firmware install that ships this script under Apps/.
+export PATH="$SYSTEM_PATH/bin:$SHARED_SYSTEM_PATH/bin:$SDCARD_PATH/System/bin:$PATH"
+
+# NX Redux ships shared libs under .system/lib and .system/shared/lib, so they
+# go first; RetroHub's own bundled libs come next, then the firmware's custom
+# SDL2. Thu vien SDL2 phu thuoc vao tung thiet bi va ban firmware:
+# - TrimUI Brick / Smart Pro dat ban tuy bien rieng o /usr/trimui/lib
+# - TrimUI Smart Pro S (TSPS), muOS va Linux handheld chuan dat o /usr/lib64 hoac /usr/lib
+# - $APP/libs cho phep dong goi san thu vien di kem neu thiet bi khong co san (Miyoo Mini,...)
+# pysdl2 ho tro nhieu thu muc ngan cach boi dau ":" va fallback cua no (ctypes.util.find_library)
+# khong chay duoc tren BusyBox vi thieu ldconfig/gcc/objdump.
+export LD_LIBRARY_PATH="$SYSTEM_PATH/lib:$SHARED_SYSTEM_PATH/lib:$APP/libs:$SDCARD_PATH/System/lib:/usr/trimui/lib:/usr/lib64:/usr/lib:/lib:$LD_LIBRARY_PATH"
+export PYSDL2_DLL_PATH="$APP/libs:/usr/trimui/lib:/usr/lib64:/usr/lib"
+
+# Kept outside the app folder so reinstalling or updating RetroHub does not
+# throw away a runtime that took a download to get.
+CACHE_DIR="$SDCARD_PATH/.retrohub"
+CACHE_PY="$CACHE_DIR/python/bin/python3"
+RUNTIME_URL="https://github.com/nguyenxuanhoa493/repohubtool/releases/download/runtime-python-3.11.16-aarch64/python-3.11.16-aarch64.tar.gz"
+RUNTIME_SHA="67f320dc29bf98d93c81263de37875cfef47debfdcce6b97e1c3f3ee97bbd01b"
+RUNTIME_MB=20
+
+# There is no console on a handheld: stdout vanishes and the menu redraws over
+# everything. A file at the root of the card is the only message the user can
+# actually find, so anything fatal goes there.
+# NextUI hands its tools a log directory; use it when it is there so the
+# message lands where that user already looks.
+if [ -n "$LOGS_PATH" ] && [ -d "$LOGS_PATH" ]; then
+    ERRLOG="$LOGS_PATH/RetroHub.txt"
+else
+    ERRLOG="$SDCARD_PATH/RetroHub-loi.txt"
+fi
+
+log() { echo "[RetroHub] $*"; }
+
+fatal() {
+    log "$1"
+    {
+        echo "RetroHub khong khoi dong duoc / RetroHub could not start"
+        echo "$(date 2>/dev/null)"
+        echo
+        echo "$1"
+        echo
+        echo "$2"
+    } > "$ERRLOG" 2>/dev/null
+    exit 1
+}
+
+# A candidate only counts if it starts. -x says nothing useful here: a partial
+# copy missing its stdlib, a truncated download and a build for the wrong
+# architecture all pass the executable test and then fail at run time. The
+# version gate keeps an ancient firmware python from getting halfway in.
+usable() {
+    [ -n "$1" ] && [ -f "$1" ] || return 1
+    [ -x "$1" ] || chmod +x "$1" 2>/dev/null
+    "$1" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)' 2>/dev/null
+}
+
+find_python() {
+    for c in \
+        "$(command -v python3 2>/dev/null)" \
+        "$APP/python/bin/python3" \
+        "$CACHE_PY" \
+        "$SDCARD_PATH/System/bin/python3" \
+        "$SDCARD_PATH/Apps/PortMaster/PortMaster/exlibs/python3" \
+        /usr/bin/python3 \
+        /usr/local/bin/python3
+    do
+        if usable "$c"; then
+            echo "$c"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Only reached when the install shipped without python/ and the device has none.
+# Wants Wi-Fi, so it is the last resort rather than the plan.
+download_python() {
+    log "Khong tim thay Python. Dang tai ban chay ve (~${RUNTIME_MB}MB)..."
+
+    free_kb="$(df -k "$SDCARD_PATH" 2>/dev/null | awk 'NR==2 {print $4}')"
+    case "$free_kb" in
+        ''|*[!0-9]*) : ;;
+        *) [ "$free_kb" -lt 204800 ] && return 1 ;;
+    esac
+
+    rm -rf "$CACHE_DIR/python" "$CACHE_DIR/py.tar.gz"
+    mkdir -p "$CACHE_DIR" || return 1
+    tgz="$CACHE_DIR/py.tar.gz"
+
+    # busybox wget is the usual one here and takes neither -q nor --tries the
+    # way GNU wget does, so each form is tried on its own. The certificate
+    # bypass comes last: a stock handheld often has no CA bundle at all, and a
+    # checksum-verified download over a bad certificate still beats no app.
+    ok=1
+    if command -v wget >/dev/null 2>&1; then
+        wget -O "$tgz" "$RUNTIME_URL" && ok=0
+        [ $ok -ne 0 ] && wget --no-check-certificate -O "$tgz" "$RUNTIME_URL" && ok=0
+    fi
+    if [ $ok -ne 0 ] && command -v curl >/dev/null 2>&1; then
+        curl -fsSL -o "$tgz" "$RUNTIME_URL" && ok=0
+        [ $ok -ne 0 ] && curl -fsSLk -o "$tgz" "$RUNTIME_URL" && ok=0
+    fi
+    [ $ok -ne 0 ] && { rm -f "$tgz"; return 1; }
+
+    # Verified when the device has sha256sum, skipped with a note when it does
+    # not - refusing to run at all would be worse than running an archive that
+    # unpacked cleanly and whose interpreter starts.
+    if command -v sha256sum >/dev/null 2>&1; then
+        got="$(sha256sum "$tgz" 2>/dev/null | awk '{print $1}')"
+        if [ "$got" != "$RUNTIME_SHA" ]; then
+            log "Tai ve bi loi (sha256 khong khop). Bo qua."
+            rm -f "$tgz"
+            return 1
+        fi
+    else
+        log "May khong co sha256sum, bo qua buoc kiem tra."
+    fi
+
+    tar xzf "$tgz" -C "$CACHE_DIR" 2>/dev/null || { rm -rf "$tgz" "$CACHE_DIR/python"; return 1; }
+    rm -f "$tgz"
+    chmod +x "$CACHE_PY" 2>/dev/null
+
+    # An archive that unpacked but will not run - wrong architecture, a missing
+    # loader - is 60MB of card wasted on something no later launch can use.
+    if usable "$CACHE_PY"; then
+        return 0
+    fi
+    log "Ban chay tai ve khong chay duoc tren may nay."
+    rm -rf "$CACHE_DIR/python"
+    return 1
+}
+
+PY="$(find_python)"
+if [ -z "$PY" ]; then
+    if download_python; then
+        PY="$CACHE_PY"
+        log "Da cai Python vao $CACHE_DIR/python"
+    else
+        fatal "May khong co Python va tai ban chay ve khong thanh cong." \
+"Hay lam mot trong hai cach sau:
+
+1. Tai ban cai day du cua RetroHub (da kem san Python) tai
+   https://retrohub.xuanhoa493.com va chep de len thu muc Apps/RetroHub.
+
+2. Noi may vao Wi-Fi roi mo lai RetroHub - app se tu tai ban chay ve.
+
+--
+The device has no Python and downloading the runtime failed.
+Either reinstall RetroHub from the full package (Python included) at
+https://retrohub.xuanhoa493.com, or connect the device to Wi-Fi and
+open RetroHub again so it can fetch the runtime itself."
+    fi
+fi
+
+# Got this far, so the previous failure - if any - is stale.
+rm -f "$ERRLOG" 2>/dev/null
+
+# Boot hook goi vao day thay vi goi thang python3: script nay la noi duy nhat
+# biet cach tim Python tren may nay. Brick Pro khong co Python trong firmware,
+# nen bon tang tim/tai o tren phai chay truoc khi daemon khoi dong duoc.
+if [ "$1" = "--led-daemon" ]; then
+    exec "$PY" led_daemon.py
+fi
+
+# Bao ve may khoi loi Kernel Panic khi tat man hinh lau (TrimUI deep suspend bug)
+touch /tmp/stay_alive 2>/dev/null
+
+while true; do
+    rm -f /tmp/launch_game.sh
+    "$PY" app.py 2>> "$ERRLOG"
+    APP_EXIT_CODE=$?
+
+    if [ -f /tmp/launch_game.sh ]; then
+        sh /tmp/launch_game.sh
+        rm -f /tmp/launch_game.sh
+        # Giu cờ stay_alive khi quay lai app
+        touch /tmp/stay_alive 2>/dev/null
+        # Don dep phong va tunnel Netplay sau khi thoat game
+        if [ -f /tmp/netplay_info.json ] || [ -f /tmp/netplay_tunnel.pid ]; then
+            "$PY" -c "from rh.netplay import stop_netplay_tunnel; stop_netplay_tunnel()" 2>/dev/null || true
+            pkill -9 -f 'localhost:55435' 2>/dev/null || true
+        fi
+    elif [ $APP_EXIT_CODE -ne 0 ] && [ -z "$RETROHUB_RECOVERED" ]; then
+        # Tu dong cuu ho neu app bi vang / loi khoi dong (Self-Healing)
+        export RETROHUB_RECOVERED=1
+        log "Phat hien app bi loi (exit code $APP_EXIT_CODE). Dang thu tu dong cuu ho..."
+        HOTFIX_URL="https://raw.githubusercontent.com/nguyenxuanhoa493/repohubtool/main/files/rh/modals/__init__.py"
+        HOTFIX_DST="$APP/rh/modals/__init__.py"
+        HOTFIX_OK=1
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSLk --max-time 20 "$HOTFIX_URL" -o "$HOTFIX_DST.tmp" 2>/dev/null && HOTFIX_OK=0
+        elif command -v wget >/dev/null 2>&1; then
+            wget --no-check-certificate -q -T 20 -O "$HOTFIX_DST.tmp" "$HOTFIX_URL" 2>/dev/null && HOTFIX_OK=0
+        fi
+        if [ $HOTFIX_OK -eq 0 ] && [ -s "$HOTFIX_DST.tmp" ]; then
+            mv -f "$HOTFIX_DST.tmp" "$HOTFIX_DST"
+            rm -f "$ERRLOG" 2>/dev/null
+            rm -rf "$APP/rh/__pycache__" "$APP/rh/modals/__pycache__" 2>/dev/null
+            log "Da tai ban va cuu ho thanh cong. Khoi dong lai RetroHub..."
+            continue
+        fi
+        break
+    else
+        break
+    fi
+done
+
+# Khi thoat han RetroHub ra he dieu hanh, huy phong va dong tunnel neu con ton tai
+rm -f /tmp/stay_alive 2>/dev/null
+if [ -f /tmp/netplay_info.json ] || [ -f /tmp/netplay_tunnel.pid ]; then
+    "$PY" -c "from rh.netplay import stop_netplay_tunnel; stop_netplay_tunnel()" 2>/dev/null || true
+    pkill -9 -f 'localhost:55435' 2>/dev/null || true
+fi
