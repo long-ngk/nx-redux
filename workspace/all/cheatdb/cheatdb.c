@@ -1,4 +1,3 @@
-#include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,29 +27,8 @@
 static SDL_Surface* screen = NULL;
 static CheatdbPaths P;
 
-// ---- download-with-progress (settings_updater.c pattern) ------------------
-typedef struct {
-	volatile int progress, speed, eta;
-	volatile bool cancel, done;
-	int result;
-} DlCtx;
-static DlCtx dl;
-static void* dl_thread(void* a) {
-	(void)a;
-	dl.result = wget_download_file(CHEATDB_URL, P.zip, &dl.progress, &dl.cancel, &dl.speed, &dl.eta);
-	dl.done = true;
-	return NULL;
-}
-static void fmt_speed(int b, char* o, size_t n) {
-	if (b >= 1024 * 1024)
-		snprintf(o, n, "%.1f MB/s", b / (1024.0 * 1024.0));
-	else if (b >= 1024)
-		snprintf(o, n, "%.0f KB/s", b / 1024.0);
-	else if (b > 0)
-		snprintf(o, n, "%d B/s", b);
-	else
-		o[0] = '\0';
-}
+// ---- download-with-progress ----------------------------------------------
+static WgetDownloadJob dl;
 static void render_progress(const char* status, int pct, const char* detail, int cancelable) {
 	GFX_clear(screen);
 	UI_renderMenuBar(screen, TITLE);
@@ -68,6 +46,13 @@ static bool enough_space(void) {
 	return free_kb >= CHEATDB_NEED_KB;
 }
 
+// The download's scratch folder (the zip and its extraction) goes once the install ends, however it ends.
+static void remove_tmpdir(void) {
+	char rm[600];
+	snprintf(rm, sizeof(rm), "rm -rf '%s'", P.tmpdir);
+	system(rm);
+}
+
 // Returns true on a completed install, false on cancel/failure (message shown).
 static bool do_download(void) {
 	if (!enough_space()) {
@@ -78,10 +63,7 @@ static bool do_download(void) {
 	snprintf(tmpcmd, sizeof(tmpcmd), "rm -rf '%s'; mkdir -p '%s'", P.tmpdir, P.tmpdir);
 	system(tmpcmd);
 
-	memset(&dl, 0, sizeof(dl));
-	dl.progress = -1;
-	pthread_t th;
-	if (pthread_create(&th, NULL, dl_thread, NULL) != 0) {
+	if (!wget_job_start(&dl, CHEATDB_URL, P.zip, -1)) {
 		UI_showMessage(screen, "Download failed to start", 3000);
 		return false;
 	}
@@ -95,14 +77,12 @@ static bool do_download(void) {
 		if (PAD_justPressed(BTN_B))
 			dl.cancel = true;
 		char sp[32];
-		fmt_speed(dl.speed, sp, sizeof(sp));
+		wget_format_speed(dl.speed, sp, sizeof(sp));
 		render_progress("Downloading cheat database...", dl.progress, sp, 1);
 	}
-	pthread_join(th, NULL);
+	wget_job_join(&dl);
 	if (dl.cancel || dl.result < 0) {
-		char rm[600];
-		snprintf(rm, sizeof(rm), "rm -rf '%s'", P.tmpdir);
-		system(rm);
+		remove_tmpdir();
 		if (!dl.cancel)
 			UI_showMessage(screen, "Download failed (check WiFi)", 3000);
 		return false;
@@ -115,9 +95,7 @@ static bool do_download(void) {
 	else
 		snprintf(vcmd, sizeof(vcmd), "'%s' -tq '%s' >/dev/null 2>&1", P.unzip, P.zip);
 	if (system(vcmd) != 0) {
-		char rm[600];
-		snprintf(rm, sizeof(rm), "rm -rf '%s'", P.tmpdir);
-		system(rm);
+		remove_tmpdir();
 		UI_showMessage(screen, "Downloaded archive is corrupt", 3000);
 		return false;
 	}
@@ -138,9 +116,7 @@ static bool do_download(void) {
 	if (Cheatdb_remoteLastModified(nx_ca_bundle_path(), lm, sizeof(lm)) <= 0)
 		snprintf(lm, sizeof(lm), "installed");
 	Cheatdb_writeDbVersion(&P, lm);
-	char rm[600];
-	snprintf(rm, sizeof(rm), "rm -rf '%s'", P.tmpdir);
-	system(rm);
+	remove_tmpdir();
 	UI_showMessage(screen, "Done. Open a game and see Options > Cheats.", 2500);
 	return true;
 }

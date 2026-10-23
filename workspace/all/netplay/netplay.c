@@ -61,6 +61,15 @@ typedef struct {
 	bool have_p2;
 } FrameInput;
 
+// How long a half-received packet, or a send that makes no progress, may
+// stall before the link is treated as dead (a pulled cable otherwise blocks
+// the emulator thread for good).
+#define NETPLAY_PACKET_TIMEOUT_MS 2000
+// The same for the savestate transfer at sync time (no progress for this long)
+#define NETPLAY_STATE_TIMEOUT_MS 5000
+// Largest payload a packet may carry; anything bigger is a corrupt stream
+#define NETPLAY_MAX_PAYLOAD 4096
+
 // Packet header
 typedef struct __attribute__((packed)) {
 	uint8_t cmd;
@@ -110,18 +119,11 @@ static struct {
 	// State sync flags
 	bool needs_state_sync;
 
-	// Discovery
-	NetplayHostInfo discovered_hosts[NETPLAY_MAX_HOSTS];
-	int num_hosts;
-	bool discovery_active;
-
 	// Threading
 	pthread_t listen_thread;
 	pthread_mutex_t mutex;
 	volatile bool running;
 
-	// Status
-	char status_msg[128];
 	int stall_frames;
 
 	// Optimization: Cached audio silence state (updated per frame)
@@ -164,7 +166,6 @@ void Netplay_init(void) {
 	np.port = NETPLAY_DEFAULT_PORT;
 	pthread_mutex_init(&np.mutex, NULL);
 	NET_getLocalIP(np.local_ip, sizeof(np.local_ip));
-	snprintf(np.status_msg, sizeof(np.status_msg), "Netplay ready");
 	np.initialized = true;
 }
 
@@ -178,7 +179,6 @@ void Netplay_quit(void) {
 
 	Netplay_disconnect();
 	Netplay_stopHostFast();
-	Netplay_stopDiscovery();
 
 	// Handle hotspot cleanup asynchronously
 	if (needs_hotspot_cleanup) {
@@ -259,7 +259,7 @@ int Netplay_startHost(const char* game_name, uint32_t game_crc, const char* hots
 	}
 
 	// Create TCP listen socket using shared utility
-	np.listen_fd = NET_createListenSocket(np.port, np.status_msg, sizeof(np.status_msg));
+	np.listen_fd = NET_createListenSocket(np.port, NULL, 0);
 	if (np.listen_fd < 0) {
 		if (hotspot_ip) {
 			np.using_hotspot = false;
@@ -275,7 +275,6 @@ int Netplay_startHost(const char* game_name, uint32_t game_crc, const char* hots
 		if (hotspot_ip) {
 			np.using_hotspot = false;
 		}
-		snprintf(np.status_msg, sizeof(np.status_msg), "Failed to create broadcast socket");
 		return -1;
 	}
 
@@ -290,7 +289,6 @@ int Netplay_startHost(const char* game_name, uint32_t game_crc, const char* hots
 	np.state = NETPLAY_STATE_WAITING;
 	np.needs_state_sync = true;
 
-	snprintf(np.status_msg, sizeof(np.status_msg), "Hosting on %s:%d", np.local_ip, np.port);
 	return 0;
 }
 
@@ -310,7 +308,7 @@ static void Netplay_restartBroadcast(void) {
 	if (np.mode != NETPLAY_HOST)
 		return; // Only for host
 
-	NET_ensureBroadcastSocket(&np.udp_fd, np.status_msg, sizeof(np.status_msg));
+	NET_ensureBroadcastSocket(&np.udp_fd, NULL, 0);
 }
 
 // Internal helper - stops host with optional hotspot cleanup
@@ -351,7 +349,6 @@ static int Netplay_stopHostInternal(bool skip_hotspot_cleanup) {
 
 	np.mode = NETPLAY_OFF;
 	np.state = NETPLAY_STATE_IDLE;
-	snprintf(np.status_msg, sizeof(np.status_msg), "Netplay ready");
 	return 0;
 }
 
@@ -426,7 +423,6 @@ static void* listen_thread_func(void* arg) {
 
 					init_frame_buffer();
 
-					snprintf(np.status_msg, sizeof(np.status_msg), "Client connected: %s", np.remote_ip);
 					pthread_mutex_unlock(&np.mutex);
 				}
 			}
@@ -451,7 +447,6 @@ int Netplay_connectToHost(const char* ip, uint16_t port) {
 
 	np.tcp_fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (np.tcp_fd < 0) {
-		snprintf(np.status_msg, sizeof(np.status_msg), "Socket creation failed");
 		return -1;
 	}
 
@@ -462,12 +457,10 @@ int Netplay_connectToHost(const char* ip, uint16_t port) {
 	if (inet_pton(AF_INET, ip, &addr.sin_addr) <= 0) {
 		close(np.tcp_fd);
 		np.tcp_fd = -1;
-		snprintf(np.status_msg, sizeof(np.status_msg), "Invalid IP address");
 		return -1;
 	}
 
 	np.state = NETPLAY_STATE_CONNECTING;
-	snprintf(np.status_msg, sizeof(np.status_msg), "Connecting to %s:%d...", ip, port);
 
 	// Connect with timeout
 	struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
@@ -477,7 +470,6 @@ int Netplay_connectToHost(const char* ip, uint16_t port) {
 		close(np.tcp_fd);
 		np.tcp_fd = -1;
 		np.state = NETPLAY_STATE_ERROR;
-		snprintf(np.status_msg, sizeof(np.status_msg), "Connection failed");
 		return -1;
 	}
 
@@ -495,7 +487,6 @@ int Netplay_connectToHost(const char* ip, uint16_t port) {
 
 	init_frame_buffer();
 
-	snprintf(np.status_msg, sizeof(np.status_msg), "Connected to %s", ip);
 	return 0;
 }
 
@@ -520,33 +511,14 @@ void Netplay_disconnect(void) {
 	if (np.mode == NETPLAY_CLIENT) {
 		np.mode = NETPLAY_OFF;
 		np.state = NETPLAY_STATE_DISCONNECTED;
-		snprintf(np.status_msg, sizeof(np.status_msg), "Disconnected");
 	} else if (np.mode == NETPLAY_HOST) {
 		// Host stays in host mode, reset to waiting for new client
 		np.state = NETPLAY_STATE_WAITING;
 		np.needs_state_sync = true;
 		np.stall_frames = 0;
-		snprintf(np.status_msg, sizeof(np.status_msg), "Client left, waiting on %s:%d", np.local_ip, np.port);
 	} else {
 		np.state = NETPLAY_STATE_DISCONNECTED;
-		snprintf(np.status_msg, sizeof(np.status_msg), "Disconnected");
 	}
-}
-
-//////////////////////////////////////////////////////////////////////////////
-// Discovery
-//////////////////////////////////////////////////////////////////////////////
-
-void Netplay_stopDiscovery(void) {
-	if (!np.discovery_active)
-		return;
-
-	if (np.udp_fd >= 0 && np.mode == NETPLAY_OFF) {
-		close(np.udp_fd);
-		np.udp_fd = -1;
-	}
-
-	np.discovery_active = false;
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -610,7 +582,7 @@ bool Netplay_preFrame(void) {
 
 		// Try to receive remote input
 		PacketHeader hdr;
-		InputPacket remote_pkt;
+		InputPacket remote_pkt = {0};
 		bool received = recv_packet(&hdr, &remote_pkt, sizeof(remote_pkt), timeout_ms);
 
 		// Re-acquire lock for frame buffer access
@@ -624,8 +596,16 @@ bool Netplay_preFrame(void) {
 		}
 
 		if (received) {
-			if (hdr.cmd == CMD_INPUT) {
+			if (hdr.cmd == CMD_INPUT && hdr.size < sizeof(remote_pkt.input)) {
+				// no buttons in it: malformed, ignore
+			} else if (hdr.cmd == CMD_INPUT && !Netplay_frameInWindow(hdr.frame, np.run_frame)) {
+				// already run, or too far ahead for the ring: ignore
+			} else if (hdr.cmd == CMD_INPUT) {
 				FrameInput* remote_slot = get_frame_slot(hdr.frame);
+				// An input that arrives before our side reached its frame claims the
+				// slot now, so the local setup for that frame doesn't wipe it.
+				if (remote_slot->frame != hdr.frame)
+					init_frame_slot(hdr.frame);
 				uint16_t remote_input = ntohs(remote_pkt.input);
 				int16_t remote_analog[NETPLAY_ANALOG_AXES] = {0};
 				if (hdr.size >= sizeof(remote_pkt)) // a short (buttons-only) packet means centred sticks
@@ -654,22 +634,18 @@ bool Netplay_preFrame(void) {
 					np.needs_state_sync = true;
 					np.stall_frames = 0;
 					Netplay_restartBroadcast();
-					snprintf(np.status_msg, sizeof(np.status_msg), "Client left, waiting on %s:%d", np.local_ip, np.port);
 				} else {
 					np.state = NETPLAY_STATE_DISCONNECTED;
-					snprintf(np.status_msg, sizeof(np.status_msg), "Host disconnected");
 				}
 				pthread_mutex_unlock(&np.mutex);
 				return false;
 			} else if (hdr.cmd == CMD_PAUSE) {
 				np.remote_paused = true;
 				np.state = NETPLAY_STATE_PAUSED;
-				snprintf(np.status_msg, sizeof(np.status_msg), "Remote player paused");
 			} else if (hdr.cmd == CMD_RESUME) {
 				np.remote_paused = false;
 				if (!np.local_paused) {
 					np.state = NETPLAY_STATE_PLAYING;
-					snprintf(np.status_msg, sizeof(np.status_msg), "Netplay active");
 				}
 			} else if (hdr.cmd == CMD_KEEPALIVE) {
 				// Keepalive received - connection is alive, reset stall counter
@@ -692,15 +668,10 @@ bool Netplay_preFrame(void) {
 		// Skip timeout when either player is paused (menu open)
 		if (!np.local_paused && !np.remote_paused) {
 			if (np.stall_frames > NETPLAY_STALL_TIMEOUT_FRAMES) {
-				snprintf(np.status_msg, sizeof(np.status_msg), "Connection timeout");
 				np.state = NETPLAY_STATE_DISCONNECTED;
 				np.audio_should_silence = false;
 				pthread_mutex_unlock(&np.mutex);
 				return false;
-			} else if (np.stall_frames > NETPLAY_STALL_WARNING_FRAMES) {
-				// Show countdown warning to user
-				int remaining = (NETPLAY_STALL_TIMEOUT_FRAMES - np.stall_frames) / 60;
-				snprintf(np.status_msg, sizeof(np.status_msg), "Waiting... (%ds)", remaining);
 			}
 		}
 		np.state = NETPLAY_STATE_STALLED;
@@ -788,18 +759,10 @@ int Netplay_sendState(const void* data, size_t size) {
 		return -1;
 	}
 
-	// Send state data in chunks
-	const uint8_t* ptr = (const uint8_t*)data;
-	size_t remaining = size;
-
-	while (remaining > 0) {
-		size_t chunk = (remaining > 4096) ? 4096 : remaining;
-		ssize_t sent = send(np.tcp_fd, ptr, chunk, MSG_NOSIGNAL);
-		if (sent <= 0) {
-			return -1;
-		}
-		ptr += sent;
-		remaining -= sent;
+	// Send the state; a link that stops taking data fails the sync (the
+	// caller then disconnects) instead of blocking the emulator thread
+	if (NET_sendAll(np.tcp_fd, data, size, NETPLAY_STATE_TIMEOUT_MS) != 1) {
+		return -1;
 	}
 
 	// Wait for client ACK
@@ -832,26 +795,13 @@ int Netplay_receiveState(void* data, size_t size) {
 	state_size = ntohl(state_size);
 
 	if (state_size != size) {
-		snprintf(np.status_msg, sizeof(np.status_msg),
-				 "State size mismatch: %u vs %zu", state_size, size);
 		return -1;
 	}
 
-	// Receive state data
-	uint8_t* ptr = (uint8_t*)data;
-	size_t remaining = size;
-
-	while (remaining > 0) {
-		ssize_t received = recv(np.tcp_fd, ptr, remaining, 0);
-		if (received <= 0) {
-			if (errno == EAGAIN || errno == EWOULDBLOCK) {
-				usleep(1000);
-				continue;
-			}
-			return -1;
-		}
-		ptr += received;
-		remaining -= received;
+	// Receive state data; a link that stops delivering fails the sync (the
+	// caller then disconnects) instead of blocking the emulator thread
+	if (NET_recvAll(np.tcp_fd, data, size, NETPLAY_STATE_TIMEOUT_MS, NULL) != 1) {
+		return -1;
 	}
 
 	// Send ACK to host
@@ -893,7 +843,6 @@ void Netplay_completeStateSync(void) {
 	np.stall_frames = 0;
 	np.audio_should_silence = false;
 
-	snprintf(np.status_msg, sizeof(np.status_msg), "Netplay active");
 	pthread_mutex_unlock(&np.mutex);
 }
 
@@ -929,7 +878,6 @@ void Netplay_pause(void) {
 	np.local_paused = true;
 	send_packet(CMD_PAUSE, 0, NULL, 0);
 	np.state = NETPLAY_STATE_PAUSED;
-	snprintf(np.status_msg, sizeof(np.status_msg), "Paused");
 	pthread_mutex_unlock(&np.mutex);
 }
 
@@ -945,14 +893,12 @@ void Netplay_resume(void) {
 	if (!np.remote_paused) {
 		np.state = NETPLAY_STATE_PLAYING;
 		np.stall_frames = 0;
-		snprintf(np.status_msg, sizeof(np.status_msg), "Netplay active");
 	} else {
 		// STALLED, not PAUSED: Netplay_update runs the lockstep only in PLAYING or STALLED, so PAUSED would run the
 		// core free (no input exchange) and never read the peer's RESUME. Stalled, Netplay_preFrame keeps polling
 		// (no timeout while the peer is paused) and picks up the RESUME and the peer's input in step.
 		np.state = NETPLAY_STATE_STALLED;
 		np.stall_frames = 0;
-		snprintf(np.status_msg, sizeof(np.status_msg), "Waiting for remote...");
 	}
 	pthread_mutex_unlock(&np.mutex);
 }
@@ -969,7 +915,6 @@ void Netplay_pollWhilePaused(void) {
 	if (getsockopt(np.tcp_fd, SOL_SOCKET, SO_ERROR, &error, &len) < 0 || error != 0) {
 		pthread_mutex_lock(&np.mutex);
 		np.state = NETPLAY_STATE_DISCONNECTED;
-		snprintf(np.status_msg, sizeof(np.status_msg), "Connection lost");
 		close(np.tcp_fd);
 		np.tcp_fd = -1;
 		pthread_mutex_unlock(&np.mutex);
@@ -1051,24 +996,33 @@ bool Netplay_isPaused(void) {
 //////////////////////////////////////////////////////////////////////////////
 
 static bool send_packet(uint8_t cmd, uint32_t frame, const void* data, uint16_t size) {
-	if (np.tcp_fd < 0)
+	int fd = np.tcp_fd;
+	if (fd < 0)
+		return false;
+	if (!data)
+		size = 0;
+	if (size > NETPLAY_MAX_PAYLOAD)
 		return false;
 
+	// header + payload in one buffer: one bounded send, never half a packet
+	// followed by a separate blocking call
+	uint8_t buf[sizeof(PacketHeader) + NETPLAY_MAX_PAYLOAD];
 	PacketHeader hdr = {
 		.cmd = cmd,
 		.frame = htonl(frame),
 		.size = htons(size)};
+	memcpy(buf, &hdr, sizeof(hdr));
+	if (size > 0)
+		memcpy(buf + sizeof(hdr), data, size);
 
-	if (send(np.tcp_fd, &hdr, sizeof(hdr), MSG_NOSIGNAL) != sizeof(hdr)) {
+	if (NET_sendAll(fd, buf, sizeof(hdr) + size, NETPLAY_PACKET_TIMEOUT_MS) != 1) {
+		// Dead or stuck link (the stream may also hold a partial packet now):
+		// shut it down so the receive side sees the close and tears the
+		// session down through handle_recv_disconnect. The fd stays open
+		// until then, so it can't be reused under another thread.
+		shutdown(fd, SHUT_RDWR);
 		return false;
 	}
-
-	if (size > 0 && data) {
-		if (send(np.tcp_fd, data, size, MSG_NOSIGNAL) != size) {
-			return false;
-		}
-	}
-
 	return true;
 }
 
@@ -1094,12 +1048,10 @@ static void handle_recv_disconnect(int fd) {
 		np.state = NETPLAY_STATE_WAITING;
 		np.needs_state_sync = true;
 		np.stall_frames = 0;
-		snprintf(np.status_msg, sizeof(np.status_msg), "Client left, waiting on %s:%d", np.local_ip, np.port);
 		pthread_mutex_unlock(&np.mutex);
 		Netplay_restartBroadcast(); // Can be called without mutex
 	} else {
 		np.state = NETPLAY_STATE_DISCONNECTED;
-		snprintf(np.status_msg, sizeof(np.status_msg), "Remote disconnected");
 		pthread_mutex_unlock(&np.mutex);
 	}
 }
@@ -1130,43 +1082,37 @@ static bool recv_packet(PacketHeader* hdr, void* data, uint16_t max_size, int ti
 		return false; // Timeout or error
 	}
 
-	ssize_t ret = recv(fd, hdr, sizeof(*hdr), 0);
-	if (ret == 0) {
-		// Connection closed by remote end
+	// The header and payload are read whole, with a bounded wait: a packet
+	// cut off part way (dead link, corrupt sender) can't be resynchronised,
+	// so it ends the session instead of misaligning every later read.
+	size_t got = 0;
+	int r = NET_recvAll(fd, hdr, sizeof(*hdr), NETPLAY_PACKET_TIMEOUT_MS, &got);
+	if (r == 0 && got == 0)
+		return false; // spurious wakeup, nothing arrived
+	if (r != 1) {
 		handle_recv_disconnect(fd);
-		return false;
-	}
-	if (ret < 0 || ret != sizeof(*hdr)) {
-		// Error or partial read
-		if (errno == ECONNRESET || errno == EPIPE || errno == ENOTCONN) {
-			handle_recv_disconnect(fd);
-		}
 		return false;
 	}
 
 	hdr->frame = ntohl(hdr->frame);
 	hdr->size = ntohs(hdr->size);
 
-	// Validate packet size to prevent malformed packet issues
-	if (hdr->size > 4096) {
-		return false; // Reject suspiciously large packets
+	if (hdr->size > NETPLAY_MAX_PAYLOAD) {
+		LOG_error("Netplay: packet of %u bytes, stream corrupt - disconnecting\n", hdr->size);
+		handle_recv_disconnect(fd);
+		return false;
 	}
 
 	if (hdr->size > 0) {
 		// Always consume exactly hdr->size payload bytes. If we can't deliver them
 		// to the caller's buffer (none supplied, or larger than max_size), drain
 		// them into scratch — leaving them in the stream would make the next
-		// recv() read payload bytes as a header and desync the session for good.
-		// hdr->size is bounded to <= 4096 by the check above.
-		char scratch[4096];
+		// read take payload bytes as a header and desync the session for good.
+		char scratch[NETPLAY_MAX_PAYLOAD];
 		bool deliver = (data && hdr->size <= max_size);
 		void* dst = deliver ? data : (void*)scratch;
-		ret = recv(fd, dst, hdr->size, 0);
-		if (ret == 0) {
+		if (NET_recvAll(fd, dst, hdr->size, NETPLAY_PACKET_TIMEOUT_MS, NULL) != 1) {
 			handle_recv_disconnect(fd);
-			return false;
-		}
-		if (ret != hdr->size) {
 			return false;
 		}
 		if (!deliver) {

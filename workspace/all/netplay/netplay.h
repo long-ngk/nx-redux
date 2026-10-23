@@ -16,7 +16,6 @@
 #define NETPLAY_DISCOVERY_PORT 55436
 #define NETPLAY_PROTOCOL_VERSION 3 // 3: input packets carry both sticks
 #define NETPLAY_MAX_GAME_NAME 64
-#define NETPLAY_MAX_HOSTS 8
 
 // Frame buffer for rollback (power of 2 for efficient wraparound)
 #define NETPLAY_FRAME_BUFFER_SIZE 64
@@ -25,11 +24,17 @@
 // Stall/timeout constants - extended for reliability on lossy networks
 // Pokemon games can pause 2+ seconds during save operations
 #define NETPLAY_STALL_TIMEOUT_FRAMES 180	 // 3 seconds at 60fps (was 30 frames/500ms)
-#define NETPLAY_STALL_WARNING_FRAMES 60		 // 1 second warning before disconnect
 #define NETPLAY_KEEPALIVE_INTERVAL_FRAMES 30 // Send keepalive every 500ms during stall
 
 // Input latency frames (to hide network jitter)
 #define NETPLAY_INPUT_LATENCY_FRAMES 2
+
+// Whether a received input for `frame` can be kept while `run_frame` is the next
+// frame to run: it must not be run already, and it must fit in the ring without
+// landing on a slot an unrun frame still uses. Frame numbers wrap with uint32_t.
+static inline bool Netplay_frameInWindow(uint32_t frame, uint32_t run_frame) {
+	return (uint32_t)(frame - run_frame) < NETPLAY_FRAME_BUFFER_SIZE;
+}
 
 typedef enum {
 	NETPLAY_OFF = 0,
@@ -48,13 +53,6 @@ typedef enum {
 	NETPLAY_STATE_DISCONNECTED,
 	NETPLAY_STATE_ERROR
 } NetplayState;
-
-typedef struct {
-	char game_name[NETPLAY_MAX_GAME_NAME];
-	char host_ip[16];
-	uint16_t port;
-	uint32_t game_crc;
-} NetplayHostInfo;
 
 // Initialize/cleanup
 void Netplay_init(void);
@@ -78,9 +76,6 @@ void Netplay_disconnect(void);
 NetplayMode Netplay_getMode(void);
 bool Netplay_isConnected(void);
 bool Netplay_isActive(void);
-
-// Host discovery (for client)
-void Netplay_stopDiscovery(void);
 
 // Frame synchronization (RetroArch-style)
 // Called at the start of each frame - handles network polling and sync

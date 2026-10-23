@@ -1,6 +1,7 @@
 #ifndef TYPES_H
 #define TYPES_H
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,12 +16,12 @@ typedef struct Array {
 } Array;
 
 Array* Array_new(void);
-void Array_push(Array* self, void* item);
-void Array_unshift(Array* self, void* item);
+// Both return false (and leave the array as it was) when growing it fails: the item is still the caller's.
+bool Array_push(Array* self, void* item);
+bool Array_unshift(Array* self, void* item);
 void* Array_pop(Array* self);
 void Array_remove(Array* self, void* item);
 void Array_free(Array* self);
-void Array_yoink(Array* self, Array* other);
 
 void StringArray_free(Array* self);
 
@@ -62,6 +63,9 @@ typedef struct Entry {
 Entry* Entry_new(const char* path, int type);
 Entry* Entry_newNamed(const char* path, int type, const char* displayName);
 void Entry_free(Entry* self);
+// Appends entry, a fresh Entry_new/Entry_newNamed result: false for a NULL entry (its allocation failed) or when the
+// array can't grow, which frees the entry.
+bool EntryArray_push(Array* self, Entry* entry);
 void EntryArray_sort(Array* self);
 void EntryArray_free(Array* self);
 

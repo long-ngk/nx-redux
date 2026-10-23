@@ -15,8 +15,13 @@
 #include "gamelist.h"
 #include "launcher.h"
 #include "list_window.h"
+#include "path_stack.h"
 #include "menutabs.h"
 #include "shortcuts.h"
+
+// The ROM behind a row launched from a collection's list, beside LAST_PATH (which saves the row by its file name):
+// one game on two consoles in a collection has two rows of that name. Transient, like LAST_PATH.
+#define LAST_ROM_PATH "/tmp/last_rom.txt"
 
 ///////////////////////////////////////
 
@@ -27,6 +32,18 @@ static void queueNext(char* cmd) {
 	// Every external launch (rom, pak, script, auto-resume) comes through here and then leaves nextui with
 	// _exit, so CollCount_quit never runs: write the collection counts now (the worker defers its writes).
 	CollCount_flush();
+}
+
+// Builds the queued shell command "'a'" or "'a' 'b'" (b may be NULL), each
+// argument single-quote escaped. False if either escape or the command does
+// not fit, so a launch never runs with a truncated or unbalanced argument.
+static bool buildQuotedCommand(char* out, size_t size, const char* a, const char* b) {
+	char ea[MAX_PATH * 4];
+	char eb[MAX_PATH * 4];
+	if (shellEscapeQuotes(ea, sizeof(ea), a) < 0 || (b && shellEscapeQuotes(eb, sizeof(eb), b) < 0))
+		return false;
+	int n = b ? snprintf(out, size, "'%s' '%s'", ea, eb) : snprintf(out, size, "'%s'", ea);
+	return n >= 0 && (size_t)n < size;
 }
 
 // Fire-and-forget launch that leaves this process's SIGCHLD disposition
@@ -171,19 +188,8 @@ int autoResume(void) {
 	char* gametimectl_argv[] = {"gametimectl.elf", "start", sd_path, NULL};
 	runCommandAsync("gametimectl.elf", gametimectl_argv);
 
-	// Escaped buffers are 4x MAX_PATH so worst-case single-quote escaping
-	// (each ' -> '\'', +3 bytes) of a MAX_PATH source can never overflow and
-	// leave escapeSingleQuotes bailing mid-string with unbalanced quotes.
-	char escaped_emu[MAX_PATH * 4];
-	char escaped_sd[MAX_PATH * 4];
-	strncpy(escaped_emu, emu_path, sizeof(escaped_emu) - 1);
-	escaped_emu[sizeof(escaped_emu) - 1] = '\0';
-	strncpy(escaped_sd, sd_path, sizeof(escaped_sd) - 1);
-	escaped_sd[sizeof(escaped_sd) - 1] = '\0';
-
 	char cmd[MAX_PATH * 8]; // holds two worst-case escaped MAX_PATH strings + quotes
-	int n = snprintf(cmd, sizeof(cmd), "'%s' '%s'", escapeSingleQuotes(escaped_emu, sizeof(escaped_emu)), escapeSingleQuotes(escaped_sd, sizeof(escaped_sd)));
-	if (n < 0 || (size_t)n >= sizeof(cmd)) {
+	if (!buildQuotedCommand(cmd, sizeof(cmd), emu_path, sd_path)) {
 		LOG_error("autoResume: launch command too long, aborting\n");
 		return 0;
 	}
@@ -255,13 +261,10 @@ int pendingLaunch(void) {
 // Queue "<path>/launch.sh" as the next command. Returns false (and stays on
 // the menu) if the escaped command doesn't fit.
 static bool queuePakLaunch(char* path) {
-	char escaped_path[MAX_PATH * 4]; // 4x so worst-case escaping can't overflow
-	strncpy(escaped_path, path, sizeof(escaped_path) - 1);
-	escaped_path[sizeof(escaped_path) - 1] = '\0';
-
+	char launch_path[MAX_PATH + 16];
+	int n = snprintf(launch_path, sizeof(launch_path), "%s/launch.sh", path);
 	char cmd[MAX_PATH * 5]; // worst-case escaped path + quotes + "/launch.sh"
-	int n = snprintf(cmd, sizeof(cmd), "'%s/launch.sh'", escapeSingleQuotes(escaped_path, sizeof(escaped_path)));
-	if (n < 0 || (size_t)n >= sizeof(cmd)) {
+	if (n < 0 || (size_t)n >= sizeof(launch_path) || !buildQuotedCommand(cmd, sizeof(cmd), launch_path, NULL)) {
 		LOG_error("queuePakLaunch: launch command too long, aborting\n");
 		startgame = false; // keep the launcher on the menu instead of blanking
 		return false;
@@ -322,19 +325,8 @@ void openScript(char* script_path, char* arg, char* last_path) {
 	// position (saveLast is what loadLast() restores from on relaunch).
 	saveLast(last_path);
 
-	// escapeSingleQuotes modifies its buffer, so use separate copies.
-	// 4x MAX_PATH so worst-case escaping can't overflow / unbalance quotes.
-	char escaped_script[MAX_PATH * 4];
-	strncpy(escaped_script, script_path, sizeof(escaped_script) - 1);
-	escaped_script[sizeof(escaped_script) - 1] = '\0';
-
-	char escaped_arg[MAX_PATH * 4];
-	strncpy(escaped_arg, arg, sizeof(escaped_arg) - 1);
-	escaped_arg[sizeof(escaped_arg) - 1] = '\0';
-
 	char cmd[MAX_PATH * 8]; // holds two worst-case escaped MAX_PATH strings + quotes
-	int n = snprintf(cmd, sizeof(cmd), "'%s' '%s'", escapeSingleQuotes(escaped_script, sizeof(escaped_script)), escapeSingleQuotes(escaped_arg, sizeof(escaped_arg)));
-	if (n < 0 || (size_t)n >= sizeof(cmd)) {
+	if (!buildQuotedCommand(cmd, sizeof(cmd), script_path, arg)) {
 		LOG_error("openScript: command too long, aborting\n");
 		return;
 	}
@@ -408,18 +400,8 @@ void openRom(char* path, char* last) {
 
 	// Queue the launch command FIRST to minimize delay — queueNext writes
 	// /tmp/next and sets quit=true so the main loop exits ASAP.
-	// escapeSingleQuotes modifies its buffer, so use separate copies.
-	// 4x MAX_PATH so worst-case escaping can't overflow / unbalance quotes.
-	char escaped_emu[MAX_PATH * 4];
-	char escaped_sd[MAX_PATH * 4];
-	strncpy(escaped_emu, emu_path, sizeof(escaped_emu) - 1);
-	escaped_emu[sizeof(escaped_emu) - 1] = '\0';
-	strncpy(escaped_sd, sd_path, sizeof(escaped_sd) - 1);
-	escaped_sd[sizeof(escaped_sd) - 1] = '\0';
-
 	char cmd[MAX_PATH * 8]; // holds two worst-case escaped MAX_PATH strings + quotes
-	int n = snprintf(cmd, sizeof(cmd), "'%s' '%s'", escapeSingleQuotes(escaped_emu, sizeof(escaped_emu)), escapeSingleQuotes(escaped_sd, sizeof(escaped_sd)));
-	if (n < 0 || (size_t)n >= sizeof(cmd)) {
+	if (!buildQuotedCommand(cmd, sizeof(cmd), emu_path, sd_path)) {
 		LOG_error("openRom: launch command too long, aborting\n");
 		startgame = false; // keep the launcher on the menu instead of blanking
 		return;
@@ -454,49 +436,38 @@ void openRom(char* path, char* last) {
 }
 
 static bool isDirectSubdirectory(const Directory* parent, const char* child_path) {
-	const char* parent_path = parent->path;
+	return PathStack_isDirectChild(parent->path, child_path, PLATFORM);
+}
 
-	size_t parent_len = strlen(parent_path);
-	size_t child_len = strlen(child_path);
+typedef struct {
+	Array* array;
+	int root_rows;
+	int list_rows;
+} StackBuild;
 
-	// Child must be longer than parent to be a subdirectory
-	if (child_len <= parent_len || strncmp(child_path, parent_path, parent_len) != 0) {
-		return false;
-	}
+// One directory of pathToStack's walk: pushed, or (a PLATFORM segment) merged into the one before it.
+static void pushStackDir(void* ctx, const char* dir_path, bool merge) {
+	StackBuild* build = ctx;
+	Array* array = build->array;
+	if (merge) {
+		// Merge with previous directory
+		if (array->count > 0) {
+			// Remove the previous directory
+			Directory* last = (Directory*)array->items[array->count - 1];
+			Array_pop(array);
+			Directory_free(last); // assuming you have a Directory_free
 
-	// Next char after parent path must be '/'
-	if (child_path[parent_len] != '/')
-		return false;
-
-	// Walk through the child path after parent, skipping PLATFORM segments
-	const char* cursor = child_path + parent_len + 1; // skip the slash
-
-	int levels = 0;
-	while (*cursor) {
-		const char* next = strchr(cursor, '/');
-		size_t segment_len = next ? (size_t)(next - cursor) : strlen(cursor);
-
-		if (segment_len == 0)
-			break;
-
-		// Copy segment into a buffer to compare
-		char segment[PATH_MAX];
-		if (segment_len >= PATH_MAX)
-			return false;
-		strncpy(segment, cursor, segment_len);
-		segment[segment_len] = '\0';
-
-		// Count level only if it's not PLATFORM
-		if (strcmp(segment, PLATFORM) != 0 && strcmp(segment, "Roms") != 0) {
-			levels++;
+			// Replace with updated one using combined path (the root's rows when it replaces the root)
+			Directory* merged = Directory_new((char*)dir_path, 0);
+			int rows = array->count == 0 ? build->root_rows : build->list_rows;
+			ListWindow_fromTop(merged->entries->count, rows, &merged->start, &merged->end);
+			Array_push(array, merged);
 		}
-
-		if (!next)
-			break;
-		cursor = next + 1;
+	} else {
+		Directory* dir = Directory_new((char*)dir_path, 0);
+		ListWindow_fromTop(dir->entries->count, build->list_rows, &dir->start, &dir->end);
+		Array_push(array, dir);
 	}
-
-	return (levels == 1); // exactly one meaningful level deeper
 }
 
 static Array* pathToStack(const char* path) {
@@ -525,62 +496,8 @@ static Array* pathToStack(const char* path) {
 	if (exactMatch(path, base))
 		return array;
 
-	char temp_path[PATH_MAX];
-	strcpy(temp_path, base);
-	size_t current_len = strlen(base);
-
-	const char* cursor = path + current_len;
-	if (*cursor == '/')
-		cursor++;
-
-	while (*cursor) {
-		const char* next = strchr(cursor, '/');
-		size_t segment_len = next ? (size_t)(next - cursor) : strlen(cursor);
-		if (segment_len == 0 || segment_len >= PATH_MAX)
-			break;
-
-		char segment[PATH_MAX];
-		strncpy(segment, cursor, segment_len);
-		segment[segment_len] = '\0';
-
-		// Append '/' if needed
-		if (temp_path[current_len - 1] != '/') {
-			if (current_len + 1 >= PATH_MAX)
-				break;
-			temp_path[current_len++] = '/';
-			temp_path[current_len] = '\0';
-		}
-
-		// Append segment
-		if (current_len + segment_len >= PATH_MAX)
-			break;
-		strcat(temp_path, segment);
-		current_len += segment_len;
-
-		if (strcmp(segment, PLATFORM) == 0) {
-			// Merge with previous directory
-			if (array->count > 0) {
-				// Remove the previous directory
-				Directory* last = (Directory*)array->items[array->count - 1];
-				Array_pop(array);
-				Directory_free(last); // assuming you have a Directory_free
-
-				// Replace with updated one using combined path (the root's rows when it replaces the root)
-				Directory* merged = Directory_new(temp_path, 0);
-				int rows = array->count == 0 ? root_rows : list_rows;
-				ListWindow_fromTop(merged->entries->count, rows, &merged->start, &merged->end);
-				Array_push(array, merged);
-			}
-		} else {
-			Directory* dir = Directory_new(temp_path, 0);
-			ListWindow_fromTop(dir->entries->count, list_rows, &dir->start, &dir->end);
-			Array_push(array, dir);
-		}
-
-		if (!next)
-			break;
-		cursor = next + 1;
-	}
+	StackBuild build = {array, root_rows, list_rows};
+	PathStack_walk(base, path, PLATFORM, pushStackDir, &build);
 
 	return array;
 }
@@ -709,6 +626,7 @@ void Entry_open(Entry* self) {
 
 			snprintf(last_path, sizeof(last_path), "%s/%s", top->path, filename);
 			last = last_path;
+			putFile(LAST_ROM_PATH, self->path); // which of the rows of that name (loadLast)
 		} else if (onHomeTab()) {
 			// save the pinned row itself, not a game folder it sits in, so
 			// loadLast reselects it on the Home tab
@@ -765,6 +683,21 @@ void pushTabOverTab(MenuTabId id, const char* select_path) {
 	MenuTabs_leaveFocus();
 	Array_push(stack, list);
 	top = list;
+}
+
+// The row of the current list a launch from a collection saved (MenuTabs_collectionRow), -1 for none.
+static int collectionRowIndex(const char* filename, const char* rom) {
+	int count = top->entries->count;
+	if (count <= 0)
+		return -1;
+	const char** paths = malloc(sizeof(*paths) * count);
+	if (!paths)
+		return -1;
+	for (int i = 0; i < count; i++)
+		paths[i] = ((Entry*)top->entries->items[i])->path;
+	int row = MenuTabs_collectionRow(paths, count, filename, rom[0] ? rom : NULL);
+	free(paths);
+	return row;
 }
 
 void loadLast(void) { // call after loading root directory
@@ -837,6 +770,12 @@ void loadLast(void) { // call after loading root directory
 	char paks_tools_path[MAX_PATH];
 	snprintf(paks_tools_path, sizeof(paks_tools_path), "%s/Tools/", PAKS_PATH);
 
+	// a launch from a collection's list: the ROM behind the row (Entry_open)
+	bool from_collection = MenuTabs_underPath(full_path, COLLECTIONS_PATH);
+	char last_rom[MAX_PATH] = "";
+	if (from_collection && exists(LAST_ROM_PATH))
+		getFile(LAST_ROM_PATH, last_rom, sizeof(last_rom));
+
 	Array* last = Array_new();
 	while (!exactMatch(last_path, SDCARD_PATH)) {
 		Array_push(last, strdup(last_path));
@@ -859,11 +798,12 @@ void loadLast(void) { // call after loading root directory
 					tmp[1] = '\0'; // 1 because we want to keep the opening parenthesis to avoid collating "Game Boy Color" and "Game Boy Advance" into "Game Boy"
 			}
 
+			int coll_row = from_collection ? collectionRowIndex(filename, last_rom) : -1;
 			for (int i = 0; i < top->entries->count; i++) {
 				Entry* entry = top->entries->items[i];
 
 				// NOTE: strlen() is required for collated_path, '\0' wasn't reading as NULL for some reason
-				if (exactMatch(entry->path, path) || (strlen(collated_path) && prefixMatch(collated_path, entry->path) && isConsoleDir(entry->path)) || (MenuTabs_underPath(full_path, COLLECTIONS_PATH) && suffixMatch(filename, entry->path)) || (prefixMatch(paks_tools_path, entry->path) && suffixMatch(slash_name, entry->path))) {
+				if (exactMatch(entry->path, path) || (strlen(collated_path) && prefixMatch(collated_path, entry->path) && isConsoleDir(entry->path)) || i == coll_row || (prefixMatch(paks_tools_path, entry->path) && suffixMatch(slash_name, entry->path))) {
 					top->selected = i;
 					if (i >= top->end)
 						ListWindow_selectAtTop(top->entries->count, GameList_rowCount(), i, &top->start, &top->end);

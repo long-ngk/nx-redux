@@ -12,18 +12,18 @@
  *     hosts allow = <ip>   only the peer that just completed the handshake
  *
  * EXEC SAFETY. The names that reach wiz_sync_pull() are remote input — they
- * arrive as FILE lines on the control channel. wizard_net.c's wiz_name_is_safe() whitelists them
+ * arrive as FILE lines on the control channel. wiz_proto.c's wiz_name_is_safe() whitelists them
  * to [A-Za-z0-9._-]+, but a whitelist upstream is a second line of defence and
- * never a licence to interpolate, so the pull runs posix_spawn(rsync_bin(), argv)
+ * never a licence to interpolate, so the pull runs posix_spawn(sync_rsyncd_bin(), argv)
  * with NO SHELL ANYWHERE. There is no command string to quote and therefore
  * nothing for a quote, space, semicolon or backtick in a name to break out of;
  * the whitelist and the spawn each stand on their own. sync.c uses popen()
  * (which is a shell) for the same job, and this file deliberately parts company
  * with it there — that is the one pattern from sync.c not copied.
  *
- * The two system() calls that remain — starting the daemon and killall rsync —
- * carry no remote data at all: their command strings are compile-time
- * constants plus rsync_bin()'s path, which is assembled from this process's
+ * The two system() calls that remain — starting the daemon and killall rsync,
+ * both in sync/sync_rsyncd.c — carry no remote data at all: their command strings are compile-time
+ * constants plus sync_rsyncd_bin()'s path, which is assembled from this process's
  * own install root. What does vary (serve_dir, the peer's address) goes into
  * the config FILE, never onto a command line, and is checked on the way in
  * for the one character that would matter there.
@@ -67,22 +67,11 @@
 #include "ui_list.h"
 #include "ui_message.h"
 #include "wizard.h"
+#include "wiz_sync_util.h"
+#include "sync_rsyncd.h"
 
 // posix_spawn's environment. POSIX leaves this one to the caller to declare.
 extern char** environ;
-
-// rsync binary path (shared across platforms). Same location as sync.c's rsync_bin_path(),
-// duplicated rather than shared because nothing in sync.c is linkable here.
-static const char* rsync_bin(void) {
-	static char path[MAX_PATH];
-	if (!path[0])
-		snprintf(path, sizeof(path), "%s/rsync", SHARED_BIN_PATH);
-	return path;
-}
-
-// How long the daemon gets to write its pidfile before we call it dead
-// (same as sync.c's start_rsync_daemon()).
-#define WIZ_SYNC_DAEMON_SETTLE_US 500000
 
 // Hard ceilings on the client's pull, in the order they bind: one file may not
 // hold the UI longer than FILE, and the whole set may not exceed TOTAL.
@@ -129,18 +118,9 @@ static const char* rsync_bin(void) {
 #define WIZ_SYNC_REAP_GRACE_MS 2000
 #define WIZ_SYNC_REAP_POLL_US 20000
 
-// Must equal the literal in wizard.h's wiz_sync_pull() signature: the parameter
-// is char names[][64] and this is what indexes it here.
-#define WIZ_SYNC_NAME_MAX 64
 // Longest run of rsync output held at once. --info=progress2 emits one short
 // line per redraw, so this is slack, not a budget.
 #define WIZ_SYNC_LINE_MAX 512
-// Where a pull lands before any of it is allowed into fetch_to. Inside fetch_to
-// so the commit is a same-filesystem rename; leading dot so a directory listing
-// (and NXRedux's own file browsers, which hide dotfiles) does not show it.
-#define WIZ_SYNC_STAGE_DIR ".netplay-staging"
-// Longest path this file builds: fetch_to + '/' + staging + '/' + a 63-char name.
-#define WIZ_SYNC_PATH_MAX 512
 
 //////////////////////////////////
 // Screens
@@ -216,85 +196,9 @@ static void wiz_sync_render_progress(int index, int count, int percent) {
 // Pure helpers
 //////////////////////////////////
 //
-// No sockets, no SDL, no daemon: text in, text out. Same split as wizard_net.c's
-// wire-protocol section and for the same reason — this is the half that can be
-// exercised on a development host, and it is the half that handles remote input.
-
-// A value on its way into rsyncd.conf. That file is line-oriented (one directive
-// per line, value to end of line), so a \n or \r inside a value would end the
-// directive early and start one the caller never wrote — "hosts allow = x\nhosts
-// allow = *" being the case that matters. Both values written here are trusted by
-// construction; this is what makes that assumption checkable rather than assumed.
-static bool wiz_conf_value_is_safe(const char* value) {
-	if (!value || !value[0])
-		return false;
-
-	for (const char* c = value; *c; c++)
-		if (*c == '\n' || *c == '\r')
-			return false;
-
-	return true;
-}
-
-// A dotted quad, by shape. `hosts allow` also accepts names, ranges and
-// patterns, so anything that is not digits and dots would WIDEN that ACL rather
-// than narrow it ("*" being the extreme). wizard_net.c fills peer_ip from
-// inet_ntop() and the client dials an address read the same way, so [0-9.] is
-// the entire alphabet either side can produce. Shape only — this is not an
-// address parser, and rsync validates the value itself.
-static bool wiz_ip_is_plain(const char* ip) {
-	int digits = 0;
-
-	if (!ip || !ip[0] || strlen(ip) >= 16)
-		return false;
-
-	for (const char* c = ip; *c; c++) {
-		if (*c >= '0' && *c <= '9') {
-			digits++;
-			continue;
-		}
-		if (*c == '.')
-			continue;
-		return false;
-	}
-
-	return digits > 0;
-}
-
-// The whitelist wizard_net.c's wiz_name_is_safe() applies on the wire, re-applied at this module's
-// own boundary. Not redundancy for its own sake:
-//   - these names are remote input and this file hands them to an exec and to
-//     unlinkat(); a '/' or a ".." would reach outside fetch_to either way,
-//   - wiz_name_is_safe() is static to wizard_net.c and cannot be seen from here,
-//     and
-//   - a caller added later (a bench harness, say) must not be
-//     able to skip the check by not being wizard_net.c.
-// Deliberately identical to that one, down to the explicit ranges instead of
-// isalnum() (locale-dependent); if either moves, both move.
-static bool wiz_sync_name_is_safe(const char* name) {
-	if (!name || !name[0])
-		return false;
-	if (strlen(name) >= WIZ_SYNC_NAME_MAX)
-		return false;
-	if (name[0] == '-') // rsync would read it as an option
-		return false;
-	if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
-		return false;
-
-	for (const char* c = name; *c; c++) {
-		if (*c >= 'A' && *c <= 'Z')
-			continue;
-		if (*c >= 'a' && *c <= 'z')
-			continue;
-		if (*c >= '0' && *c <= '9')
-			continue;
-		if (*c == '.' || *c == '_' || *c == '-')
-			continue;
-		return false;
-	}
-
-	return true;
-}
+// No sockets, no SDL, no daemon: text in, text out. The validators, the progress
+// parser and the staging directory live in wiz_sync_util.c (host-tested, like
+// wiz_proto.c for the wire protocol); these two need wizard.h's rsync constants.
 
 // The host's rsyncd.conf, written to an already-open stream so the exact file
 // can be checked without starting a daemon. Diverges from sync.c's
@@ -329,205 +233,10 @@ static int wiz_write_serve_conf(FILE* fp, const char* serve_dir, const char* cli
 	return ferror(fp) ? -1 : 0;
 }
 
-// Index of the first name that repeats an earlier one, or -1 when the set is
-// what it claims to be: a set. O(n²) over at most WIZ_NET_SYNC_MAX_FILES = 32
-// names, i.e. free.
-static int wiz_find_duplicate(char names[][WIZ_SYNC_NAME_MAX], int count) {
-	for (int i = 1; i < count; i++)
-		for (int j = 0; j < i; j++)
-			if (strcmp(names[i], names[j]) == 0)
-				return i;
-
-	return -1;
-}
-
 // rsync://<host>:<port>/sync/<name>. One file, one URL — split out so the exact
 // string handed to the exec can be checked without a daemon.
 static void wiz_build_pull_url(char* out, size_t out_size, const char* host_ip, const char* name) {
 	snprintf(out, out_size, "rsync://%s:%d/sync/%s", host_ip, WIZ_RSYNC_PORT, name);
-}
-
-// The percentage an --info=progress2 line carries, or -1 for a line that carries
-// none (rsync's banners, blank lines). The line reads
-//
-//     131,072 100%   12.50MB/s    0:00:00 (xfr#1, to-chk=0/1)
-//
-// so the first '%' with digits in front of it is the transfer percentage; the
-// rate that follows carries no '%' of its own. Bytes, not files, because this bar
-// is per-file: sync.c's parse_progress2() counts files out of "to-chk=X/Y", which for a
-// single-file pull only ever reads 0% then 100%.
-static int wiz_progress_percent(const char* line) {
-	for (const char* c = line; *c; c++) {
-		const char* start = c;
-		int percent;
-
-		if (*c != '%')
-			continue;
-
-		while (start > line && start[-1] >= '0' && start[-1] <= '9')
-			start--;
-		if (start == c)
-			continue; // a '%' with no number in front of it
-
-		percent = atoi(start);
-		if (percent < 0)
-			percent = 0;
-		if (percent > 100)
-			percent = 100;
-		return percent;
-	}
-
-	return -1;
-}
-
-// Consume every complete line in buf, returning the newest percentage they
-// carried (or `current` when none did) and moving the unterminated tail to the
-// front. Lines end with \r OR \n: --info=progress2 redraws in place with \r and
-// only ends with \n, which is why sync.c's read_line_cr() reads the same way. This one works
-// off a buffer rather than fgetc() because the caller has to select() on the same
-// descriptor for its deadline, and stdio's buffer is invisible to select().
-//
-// A buffer that fills up with no terminator in it at all is not progress output,
-// so it is dropped rather than grown — which is also what guarantees the caller
-// always has room to read into.
-static int wiz_take_percent(char* buf, size_t size, size_t* len, int current) {
-	size_t start = 0;
-	int percent = current;
-
-	for (size_t i = 0; i < *len; i++) {
-		if (buf[i] != '\r' && buf[i] != '\n')
-			continue;
-
-		buf[i] = '\0';
-		if (i > start) {
-			int found = wiz_progress_percent(buf + start);
-			if (found >= 0)
-				percent = found;
-		}
-		start = i + 1;
-	}
-
-	if (start > 0) {
-		memmove(buf, buf + start, *len - start);
-		*len -= start;
-	} else if (*len == size) {
-		*len = 0;
-	}
-
-	return percent;
-}
-
-//////////////////////////////////
-// Staging directory
-//////////////////////////////////
-//
-// Nothing the host sends is written into fetch_to. Every file lands in
-// fetch_to/.netplay-staging first and is renamed in only once the WHOLE set has
-// arrived, which is what makes the all-or-nothing rule true rather than
-// approximately true.
-//
-// The rule this replaces — pull straight into fetch_to and unlink the names
-// again on failure — cannot tell "rsync wrote this" from "this was already
-// here". `-t` without `--checksum` SKIPS a file whose size and mtime already
-// match, so two devices that synced yesterday and fail today would have had an
-// intact, untouched local save deleted by the failure path. That is silent save
-// loss on a device whose entire purpose is saves.
-//
-// No SDL and no network below: filesystem only, so the whole flow is exercisable
-// on a development host.
-
-// fetch_to/.netplay-staging.
-static void wiz_stage_path(char* out, size_t out_size, const char* fetch_to) {
-	snprintf(out, out_size, "%s/%s", fetch_to, WIZ_SYNC_STAGE_DIR);
-}
-
-// The staging directory and everything in it, gone. Runs as the failure path,
-// after a successful commit (by then it is empty), and again before a pull
-// starts — a directory that already exists belongs to a run that was killed, so
-// it is neither ours to commit nor the user's to keep.
-//
-// ONE LEVEL DEEP, deliberately. rsync is invoked without -r and without -d, so
-// it never creates a directory in the destination; the only things in here are
-// this file's own single-file pulls. The AT_REMOVEDIR fallback below therefore
-// only ever has to clear an EMPTY directory left by something else. A non-empty
-// one would survive, rmdir() would fail, and the next wiz_stage_prepare() would
-// then fail on mkdir() and take wiz_sync_pull() out with fetch_to untouched —
-// i.e. this fails closed, which is why it does not need to recurse.
-static void wiz_stage_purge(const char* fetch_to) {
-	char path[WIZ_SYNC_PATH_MAX];
-	DIR* dir;
-
-	wiz_stage_path(path, sizeof(path), fetch_to);
-
-	dir = opendir(path);
-	if (dir) {
-		int dir_fd = dirfd(dir);
-		struct dirent* entry;
-
-		while ((entry = readdir(dir)) != NULL) {
-			if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
-				continue;
-			if (dir_fd < 0)
-				continue;
-			// Only ever our own pulls in here, but a directory left by anything
-			// else must not stop the purge from finishing.
-			if (unlinkat(dir_fd, entry->d_name, 0) != 0)
-				unlinkat(dir_fd, entry->d_name, AT_REMOVEDIR);
-		}
-
-		closedir(dir);
-	}
-
-	rmdir(path);
-}
-
-// An empty staging directory, ready to receive. 0 = it exists and is empty.
-static int wiz_stage_prepare(const char* fetch_to) {
-	char path[WIZ_SYNC_PATH_MAX];
-
-	wiz_stage_purge(fetch_to);
-	wiz_stage_path(path, sizeof(path), fetch_to);
-
-	return mkdir(path, 0755) == 0 ? 0 : -1;
-}
-
-// Move the finished set into fetch_to, one rename() per name. Same filesystem by
-// construction (the staging directory is inside fetch_to), so each rename is
-// atomic and replaces a local save only at the instant the whole set is known
-// good. 0 = every name moved.
-//
-// A failure part-way leaves the earlier renames in place: POSIX cannot move a
-// set atomically. That window is the microseconds between two renames in a
-// directory this process owns, against the multi-second transfer window the
-// staging directory removes — and every rename that did land is a complete,
-// correct file, so a retry simply redoes them. Best effort rather than
-// stop-at-first-failure for the same reason: the closer to the full set, the
-// better off both sides are.
-static int wiz_stage_commit(const char* fetch_to, char names[][WIZ_SYNC_NAME_MAX], int count) {
-	char path[WIZ_SYNC_PATH_MAX];
-	int stage_fd;
-	int dest_fd;
-	int result = 0;
-
-	wiz_stage_path(path, sizeof(path), fetch_to);
-
-	stage_fd = open(path, O_RDONLY | O_DIRECTORY);
-	if (stage_fd < 0)
-		return -1;
-
-	dest_fd = open(fetch_to, O_RDONLY | O_DIRECTORY);
-	if (dest_fd < 0) {
-		close(stage_fd);
-		return -1;
-	}
-
-	for (int i = 0; i < count; i++)
-		if (renameat(stage_fd, names[i], dest_fd, names[i]) != 0)
-			result = -1;
-
-	close(dest_fd);
-	close(stage_fd);
-	return result;
 }
 
 //////////////////////////////////
@@ -535,34 +244,19 @@ static int wiz_stage_commit(const char* fetch_to, char names[][WIZ_SYNC_NAME_MAX
 //////////////////////////////////
 
 // Idempotent, and called on every exit path including wiz_sync_serve_start()'s
-// own failures. Clone of sync.c's stop_rsync_daemon() plus the log.
+// own failures. Device Sync's teardown (sync_rsyncd_stop) plus the log.
 void wiz_sync_serve_stop(void) {
-	FILE* fp = fopen(WIZ_RSYNC_PID, "r");
-
-	if (fp) {
-		int pid = 0;
-		if (fscanf(fp, "%d", &pid) == 1 && pid > 0)
-			kill(pid, SIGTERM);
-		fclose(fp);
-		unlink(WIZ_RSYNC_PID);
-	}
-
-	// A daemon that died before writing its pidfile leaves no other handle, so
-	// this is not belt-and-braces (stop_rsync_daemon() in sync.c does the same for the same
-	// reason). Safe on device: the only other rsync user there is sync.elf,
-	// a launcher app, which cannot be running while launch.sh has a game
-	// mid-launch — and the wizard's own pull is a client that has already
-	// finished by the time anything calls this.
-	system("killall rsync 2>/dev/null");
-
-	unlink(WIZ_RSYNC_CONF);
+	// sync_rsyncd_stop also runs killall rsync. Safe on device: the only other
+	// rsync user there is sync.elf, a launcher app, which cannot be running
+	// while launch.sh has a game mid-launch — and the wizard's own pull is a
+	// client that has already finished by the time anything calls this.
+	sync_rsyncd_stop(WIZ_RSYNC_PID, WIZ_RSYNC_CONF);
 	// Not in sync.c: the log names the peer and every file it read, and /tmp
 	// outlives this process. The session ends, the record goes with it.
 	unlink(WIZ_RSYNC_LOG);
 }
 
 int wiz_sync_serve_start(const char* serve_dir, const char* client_ip) {
-	char cmd[MAX_PATH * 4 + 128]; // quoted runtime rsync path + options
 	FILE* fp;
 	int wrote;
 
@@ -575,7 +269,7 @@ int wiz_sync_serve_start(const char* serve_dir, const char* client_ip) {
 		return -1;
 	}
 
-	if (access(rsync_bin(), X_OK) != 0) {
+	if (access(sync_rsyncd_bin(), X_OK) != 0) {
 		// Nothing created yet, so nothing to unwind.
 		wiz_sync_error("Save sharing is not\navailable on this device.");
 		return -1;
@@ -607,23 +301,10 @@ int wiz_sync_serve_start(const char* serve_dir, const char* client_ip) {
 		return -1;
 	}
 
-	// No user data in this command line; quote rsync_bin() against spaces
-	// all the same.
-	char bin_q[MAX_PATH * 4];
-	strncpy(bin_q, rsync_bin(), sizeof(bin_q) - 1);
-	bin_q[sizeof(bin_q) - 1] = '\0';
-	escapeSingleQuotes(bin_q, sizeof(bin_q));
-	snprintf(cmd, sizeof(cmd), "'%s' --daemon --config=%s", bin_q, WIZ_RSYNC_CONF);
-	if (system(cmd) != 0) {
-		wiz_sync_serve_stop();
-		wiz_sync_error("Could not start the\nsave server.");
-		return -1;
-	}
-
-	usleep(WIZ_SYNC_DAEMON_SETTLE_US);
-	if (access(WIZ_RSYNC_PID, F_OK) != 0) {
-		// Forked cleanly and then refused to bind (port already held, serve_dir
-		// unreadable). The daemon is the one thing killall can still catch.
+	// Fails also when it forked cleanly and then refused to bind (port already
+	// held, serve_dir unreadable). The daemon is the one thing killall can
+	// still catch.
+	if (sync_rsyncd_start(WIZ_RSYNC_CONF, WIZ_RSYNC_PID) != 0) {
 		wiz_sync_serve_stop();
 		wiz_sync_error("Could not start the\nsave server.");
 		return -1;
@@ -702,7 +383,7 @@ static int wiz_spawn_rsync(char* const argv[], int* out_fd, pid_t* out_pid) {
 	if (fds[1] > STDERR_FILENO)
 		posix_spawn_file_actions_addclose(&actions, fds[1]);
 
-	rc = posix_spawn(&pid, rsync_bin(), &actions, &attr, argv, environ);
+	rc = posix_spawn(&pid, sync_rsyncd_bin(), &actions, &attr, argv, environ);
 	posix_spawnattr_destroy(&attr);
 	posix_spawn_file_actions_destroy(&actions);
 	close(fds[1]);
@@ -794,7 +475,7 @@ static int wiz_pull_one(const char* host_ip, const char* stage_dir, const char* 
 	// argv, not a command string: the only element carrying remote input is url,
 	// and it is one element whatever bytes it holds. Its "rsync://" prefix also
 	// means it can never look like an option, whatever the name contributed.
-	char* argv[] = {(char*)rsync_bin(), "-t", "--inplace", "--no-perms",
+	char* argv[] = {(char*)sync_rsyncd_bin(), "-t", "--inplace", "--no-perms",
 					"--info=progress2", io_timeout, con_timeout, url, dest, NULL};
 
 	if (wiz_spawn_rsync(argv, &fd, &pid) != 0)

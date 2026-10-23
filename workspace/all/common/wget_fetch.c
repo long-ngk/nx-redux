@@ -5,12 +5,14 @@
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include "defines.h"
 #include "api.h"
 // CA-bundle resolver shared with http.c: picks the bundle to verify TLS
 // against, or NULL on a card without one.
 #include "ca_bundle.h"
+#include "utils.h" // shellEscapeQuotes
 
 // Path to wget binary in shared system bin.
 static const char* wget_bin_path(void) {
@@ -28,22 +30,10 @@ static int wget_available(void) {
 	return avail;
 }
 
-// Escape a string for use inside single quotes in shell commands.
-// Caller must provide a buffer at least 4x the length of src.
+// Escape a string for use inside single quotes in shell commands. A string
+// that does not fit comes back empty (never cut mid-escape).
 static void shell_escape_single(const char* src, char* dst, int dst_size) {
-	int j = 0;
-	for (int i = 0; src[i] && j < dst_size - 5; i++) {
-		if (src[i] == '\'') {
-			// End quote, escaped apostrophe, reopen quote: '\''
-			dst[j++] = '\'';
-			dst[j++] = '\\';
-			dst[j++] = '\'';
-			dst[j++] = '\'';
-		} else {
-			dst[j++] = src[i];
-		}
-	}
-	dst[j] = '\0';
+	shellEscapeQuotes(dst, (size_t)dst_size, src);
 }
 
 // TLS verification argument for wget. NX Redux ships a CA bundle (the
@@ -66,22 +56,60 @@ static void fetch_tls_arg(char* buf, int buf_size) {
 	snprintf(buf, buf_size, "--check-certificate=on --ca-certificate='%s'", esc);
 }
 
-int wget_fetch(const char* url, uint8_t* buffer, int buffer_size) {
-	if (!url || !buffer || buffer_size <= 0) {
-		LOG_error("[WgetFetch] Invalid parameters\n");
+// Creates a unique, empty temp file (mkstemp) for one fetch. Several threads
+// of one process (musicplayer: album art, podcast refresh, artwork, search)
+// fetch at once, so a per-process name would have them overwrite and delete
+// each other's downloads. Returns 0, or -1 if /tmp is unusable.
+static int make_tmpfile(char* path, size_t size, const char* prefix) {
+	snprintf(path, size, "/tmp/%s_XXXXXX", prefix);
+	int fd = mkstemp(path);
+	if (fd < 0) {
+		LOG_error("[WgetFetch] can't create temp file: %s\n", path);
 		return -1;
 	}
+	close(fd);
+	return 0;
+}
 
-	// Use temp file approach (reliable from within app process, same as selfupdate.c)
-	// popen + "-O -" has pipe issues when called from SDL/audio threads
-	char tmpfile[128];
-	snprintf(tmpfile, sizeof(tmpfile), "/tmp/wget_%d.tmp", getpid());
+// Reads a fetched temp file into a new buffer (NUL-terminated). Returns the
+// byte count, -1 on a read error or an empty file, or -2 when the file is
+// larger than max_size (nothing is returned: a cut body must never be parsed
+// as if it were whole).
+static int read_tmpfile(const char* tmpfile, int max_size, uint8_t** out) {
+	*out = NULL;
+	FILE* fp = fopen(tmpfile, "rb");
+	if (!fp)
+		return -1;
+	struct stat st;
+	if (fstat(fileno(fp), &st) != 0 || st.st_size <= 0) {
+		fclose(fp);
+		return -1;
+	}
+	if (st.st_size > max_size) {
+		fclose(fp);
+		return -2;
+	}
+	uint8_t* buf = malloc((size_t)st.st_size + 1);
+	if (!buf) {
+		fclose(fp);
+		return -1;
+	}
+	size_t n = fread(buf, 1, (size_t)st.st_size, fp);
+	fclose(fp);
+	if (n != (size_t)st.st_size) {
+		free(buf);
+		return -1;
+	}
+	buf[n] = '\0';
+	*out = buf;
+	return (int)n;
+}
 
+// Runs wget for url into tmpfile. Returns 0 when it produced a non-empty file;
+// strict also requires a clean exit (a cut-off transfer leaves a partial file).
+static int fetch_to_tmpfile(const char* url, const char* tmpfile, bool strict) {
 	char safe_url[4096];
 	shell_escape_single(url, safe_url, sizeof(safe_url));
-
-	if (!wget_available())
-		return -1;
 
 	char tls_arg[MAX_PATH * 4 + 64];
 	fetch_tls_arg(tls_arg, sizeof(tls_arg));
@@ -93,15 +121,55 @@ int wget_fetch(const char* url, uint8_t* buffer, int buffer_size) {
 			 wget_bin_path(), tls_arg, tmpfile, safe_url);
 
 	int ret = system(cmd);
-
 	if (ret != 0) {
 		// Check if file was created despite non-zero exit (partial download)
 		struct stat st;
-		if (stat(tmpfile, &st) != 0 || st.st_size == 0) {
+		if (strict || stat(tmpfile, &st) != 0 || st.st_size == 0) {
 			LOG_error("[WgetFetch] Failed to fetch: %s (exit=%d)\n", url, ret);
-			unlink(tmpfile);
 			return -1;
 		}
+	}
+	return 0;
+}
+
+int wget_fetch_alloc(const char* url, int max_size, uint8_t** out) {
+	if (!out)
+		return -1;
+	*out = NULL;
+	if (!url || max_size <= 0 || !wget_available())
+		return -1;
+	char tmpfile[64];
+	if (make_tmpfile(tmpfile, sizeof(tmpfile), "wget") != 0)
+		return -1;
+	int total = -1;
+	if (fetch_to_tmpfile(url, tmpfile, true) == 0) {
+		total = read_tmpfile(tmpfile, max_size, out);
+		if (total == -2)
+			LOG_error("[WgetFetch] response over %d bytes, rejected: %s\n", max_size, url);
+		else if (total < 0)
+			LOG_error("[WgetFetch] Empty response for: %s\n", url);
+	}
+	unlink(tmpfile);
+	return total;
+}
+
+int wget_fetch(const char* url, uint8_t* buffer, int buffer_size) {
+	if (!url || !buffer || buffer_size <= 0) {
+		LOG_error("[WgetFetch] Invalid parameters\n");
+		return -1;
+	}
+
+	if (!wget_available())
+		return -1;
+
+	// Use temp file approach (reliable from within app process, same as selfupdate.c)
+	// popen + "-O -" has pipe issues when called from SDL/audio threads
+	char tmpfile[64];
+	if (make_tmpfile(tmpfile, sizeof(tmpfile), "wget") != 0)
+		return -1;
+	if (fetch_to_tmpfile(url, tmpfile, false) != 0) {
+		unlink(tmpfile);
+		return -1;
 	}
 
 	// Read temp file into buffer
@@ -130,8 +198,11 @@ int wget_fetch_headers_noredirect(const char* url, char* buffer, int buffer_size
 		return -1;
 	}
 
-	char tmpfile[128];
-	snprintf(tmpfile, sizeof(tmpfile), "/tmp/wget_hdr_%d.tmp", getpid());
+	if (!wget_available())
+		return -1;
+	char tmpfile[64];
+	if (make_tmpfile(tmpfile, sizeof(tmpfile), "wget_hdr") != 0)
+		return -1;
 
 	char safe_url[4096];
 	shell_escape_single(url, safe_url, sizeof(safe_url));
@@ -139,8 +210,6 @@ int wget_fetch_headers_noredirect(const char* url, char* buffer, int buffer_size
 	// -S writes server headers to stderr; with --max-redirect=0 wget exits
 	// non-zero on a redirect, so success is judged by the captured headers,
 	// not the exit code.
-	if (!wget_available())
-		return -1;
 
 	char tls_arg[MAX_PATH * 4 + 64];
 	fetch_tls_arg(tls_arg, sizeof(tls_arg));
@@ -173,6 +242,31 @@ int wget_fetch_headers_noredirect(const char* url, char* buffer, int buffer_size
 	return total;
 }
 
+// Stops a background download started by wget_download_file: kills the wget
+// whose PID the launch shell wrote to pid_file, then waits briefly for the
+// shell to drop its done marker so the caller can remove it. (A pgrep on the
+// file path missed paths with regex characters such as '(' or '[', leaving
+// wget running.)
+static void kill_download(const char* pid_file, const char* done_marker) {
+	for (int i = 0; i < 10; i++) { // the shell writes the PID right after the fork
+		FILE* f = fopen(pid_file, "r");
+		long pid = 0;
+		if (f) {
+			int got = fscanf(f, "%ld", &pid);
+			fclose(f);
+			if (got == 1 && pid > 1) {
+				if (access(done_marker, F_OK) != 0) // not finished (and reaped) already
+					kill((pid_t)pid, SIGTERM);
+				break;
+			}
+		}
+		usleep(100000);
+	}
+	for (int i = 0; i < 20 && access(done_marker, F_OK) != 0; i++)
+		usleep(50000);
+	unlink(pid_file);
+}
+
 int wget_download_file(const char* url, const char* filepath,
 					   volatile int* progress_pct, volatile bool* should_stop,
 					   volatile int* speed_bps_out, volatile int* eta_sec_out) {
@@ -200,14 +294,19 @@ int wget_download_file(const char* url, const char* filepath,
 	snprintf(done_marker, sizeof(done_marker), "%s.done", filepath);
 	char headers_file[512];
 	snprintf(headers_file, sizeof(headers_file), "%s.headers", filepath);
+	char pid_file[512];
+	snprintf(pid_file, sizeof(pid_file), "%s.pid", filepath);
 	char safe_done_marker[2048];
 	char safe_headers_file[2048];
+	char safe_pid_file[2048];
 	shell_escape_single(done_marker, safe_done_marker, sizeof(safe_done_marker));
 	shell_escape_single(headers_file, safe_headers_file, sizeof(safe_headers_file));
+	shell_escape_single(pid_file, safe_pid_file, sizeof(safe_pid_file));
 
 	// Remove any stale markers
 	unlink(done_marker);
 	unlink(headers_file);
+	unlink(pid_file);
 
 	// Download with -S to capture response headers (Content-Length) via stderr.
 	// The poll loop below takes the LAST Content-Length, so redirects parse
@@ -216,10 +315,11 @@ int wget_download_file(const char* url, const char* filepath,
 		return -1;
 	char tls_arg[MAX_PATH * 4 + 64];
 	fetch_tls_arg(tls_arg, sizeof(tls_arg));
+	// wget's PID goes to pid_file so a cancel or stall can kill exactly it
 	snprintf(cmd, sizeof(cmd),
 			 "(%s %s -S -T 30 -t 2"
-			 " -O '%s' '%s' 2>'%s'; touch '%s') &",
-			 wget_bin_path(), tls_arg, safe_filepath, safe_url, safe_headers_file, safe_done_marker);
+			 " -O '%s' '%s' 2>'%s' & echo $! >'%s'; wait $!; touch '%s') &",
+			 wget_bin_path(), tls_arg, safe_filepath, safe_url, safe_headers_file, safe_pid_file, safe_done_marker);
 	system(cmd);
 
 	// Step 2: Poll file size for progress with speed/stall tracking
@@ -316,8 +416,7 @@ int wget_download_file(const char* url, const char* filepath,
 								   (now.tv_nsec - stall_start.tv_nsec) / 1e9;
 			if (stall_elapsed >= 60.0) {
 				LOG_error("[WgetFetch] download stalled for 60s, killing: %s\n", url);
-				snprintf(cmd, sizeof(cmd), "kill $(pgrep -f 'wget.*%s') 2>/dev/null", safe_filepath);
-				system(cmd);
+				kill_download(pid_file, done_marker);
 				unlink(done_marker);
 				unlink(headers_file);
 				// Keep partial file for resume
@@ -335,8 +434,7 @@ int wget_download_file(const char* url, const char* filepath,
 	// Step 4: Handle cancellation
 	if (should_stop && *should_stop) {
 		// Kill wget and clean up — remove file on cancel
-		snprintf(cmd, sizeof(cmd), "kill $(pgrep -f 'wget.*%s') 2>/dev/null", safe_filepath);
-		system(cmd);
+		kill_download(pid_file, done_marker);
 		unlink(done_marker);
 		unlink(headers_file);
 		unlink(filepath);
@@ -350,6 +448,7 @@ int wget_download_file(const char* url, const char* filepath,
 	// Step 5: Verify download
 	unlink(done_marker);
 	unlink(headers_file);
+	unlink(pid_file);
 	if (speed_bps_out)
 		*speed_bps_out = 0;
 	if (eta_sec_out)
@@ -374,4 +473,23 @@ int wget_download_file(const char* url, const char* filepath,
 	}
 
 	return result;
+}
+
+static void* wget_job_thread(void* arg) {
+	WgetDownloadJob* job = arg;
+	job->result = wget_download_file(job->url, job->filepath, &job->progress, &job->cancel, &job->speed, &job->eta);
+	job->done = true;
+	return NULL;
+}
+
+bool wget_job_start(WgetDownloadJob* job, const char* url, const char* filepath, int initial_progress) {
+	memset(job, 0, sizeof(*job));
+	snprintf(job->url, sizeof(job->url), "%s", url);
+	snprintf(job->filepath, sizeof(job->filepath), "%s", filepath);
+	job->progress = initial_progress;
+	return pthread_create(&job->thread, NULL, wget_job_thread, job) == 0;
+}
+
+void wget_job_join(WgetDownloadJob* job) {
+	pthread_join(job->thread, NULL);
 }

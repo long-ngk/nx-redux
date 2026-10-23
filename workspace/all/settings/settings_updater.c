@@ -111,123 +111,6 @@ static char auto_tag[128] = "";
 static char auto_error[256] = "";
 
 // ============================================
-// JSON helpers
-// ============================================
-
-
-static const char* find_zip_asset_url(const char* json, const char* asset_suffix, char* out, size_t out_size,
-									  char* digest_out, size_t digest_size) {
-	if (digest_out && digest_size > 0)
-		digest_out[0] = '\0';
-	if (!json || !asset_suffix || !out || out_size == 0)
-		return NULL;
-
-	char suffix[96];
-	snprintf(suffix, sizeof(suffix), "-%s", asset_suffix);
-
-	const char* assets = strstr(json, "\"assets\"");
-	if (!assets)
-		return NULL;
-
-	const char* pos = assets;
-	while ((pos = strstr(pos, "\"browser_download_url\"")) != NULL) {
-		pos = strchr(pos + 21, '"');
-		if (!pos)
-			break;
-
-		if (*(pos - 1) == ':') {
-			// pos points to opening quote of value
-		} else {
-			pos++;
-			while (*pos == ' ' || *pos == ':')
-				pos++;
-			if (*pos != '"')
-				continue;
-		}
-
-		pos++;
-		const char* end = strchr(pos, '"');
-		if (!end)
-			break;
-
-		size_t len = end - pos;
-		size_t suf_len = strlen(suffix);
-		if (len > suf_len && strncmp(end - suf_len, suffix, suf_len) == 0) {
-			if (len >= out_size)
-				len = out_size - 1;
-			strncpy(out, pos, len);
-			out[len] = '\0';
-
-			// Extract this asset's SHA-256 digest if present. GitHub emits
-			// "digest": "sha256:<hex>" earlier in the same asset object, so
-			// scan backward from the matched URL. Stop at the first '}' so we
-			// never pick up a different asset's digest.
-			if (digest_out && digest_size > 0) {
-				for (const char* q = pos; q > assets; q--) {
-					if (*q == '}')
-						break;
-					if (strncmp(q, "\"digest\"", 8) == 0) {
-						const char* s = strstr(q, "sha256:");
-						if (s && s < pos) {
-							s += 7;
-							size_t k = 0;
-							while (k < digest_size - 1 && isxdigit((unsigned char)*s))
-								digest_out[k++] = (char)tolower((unsigned char)*s++);
-							digest_out[k] = '\0';
-						}
-						break;
-					}
-				}
-			}
-			return out;
-		}
-
-		pos = end + 1;
-	}
-
-	return NULL;
-}
-
-static void extract_first_paragraph(const char* body, char* out, size_t out_size) {
-	if (!body || !out || out_size == 0)
-		return;
-
-	out[0] = '\0';
-	size_t j = 0;
-
-	for (size_t i = 0; body[i] && j < out_size - 1; i++) {
-		if (body[i] == '\\' && body[i + 1] == 'r') {
-			i++;
-			continue;
-		}
-		if (body[i] == '\\' && body[i + 1] == 'n') {
-			// Check for paragraph break: \n followed by optional \r then \n
-			size_t k = i + 2;
-			if (body[k] == '\\' && body[k + 1] == 'r')
-				k += 2;
-			if (body[k] == '\\' && body[k + 1] == 'n')
-				break;
-			out[j++] = ' ';
-			i++;
-			continue;
-		}
-		if (body[i] == '#') {
-			while (body[i] == '#')
-				i++;
-			if (body[i] == ' ')
-				i++;
-			i--;
-			continue;
-		}
-		out[j++] = body[i];
-	}
-
-	out[j] = '\0';
-	while (j > 0 && (out[j - 1] == ' ' || out[j - 1] == '\n' || out[j - 1] == '\r'))
-		out[--j] = '\0';
-}
-
-// ============================================
 // Version reading
 // ============================================
 
@@ -405,56 +288,11 @@ static void* extract_thread(void* arg) {
 // Download state (shared with download thread)
 // ============================================
 
-typedef struct {
-	char url[512];
-	char filepath[256];
-	volatile int progress;
-	volatile bool cancel;
-	volatile int speed;
-	volatile int eta;
-	volatile bool done;
-	int result;
-} DownloadContext;
-
-static DownloadContext dl_ctx;
-
-static void* download_thread_func(void* arg) {
-	(void)arg;
-	dl_ctx.result = wget_download_file(
-		dl_ctx.url, dl_ctx.filepath,
-		&dl_ctx.progress, &dl_ctx.cancel,
-		&dl_ctx.speed, &dl_ctx.eta);
-	dl_ctx.done = true;
-	return NULL;
-}
+static WgetDownloadJob dl_ctx;
 
 // ============================================
 // Full-screen update page helpers
 // ============================================
-
-static void format_speed(int speed_bps, char* out, size_t out_size) {
-	if (speed_bps >= 1024 * 1024)
-		snprintf(out, out_size, "%.1f MB/s", speed_bps / (1024.0 * 1024.0));
-	else if (speed_bps >= 1024)
-		snprintf(out, out_size, "%.0f KB/s", speed_bps / 1024.0);
-	else if (speed_bps > 0)
-		snprintf(out, out_size, "%d B/s", speed_bps);
-	else
-		out[0] = '\0';
-}
-
-static void format_eta(int eta_sec, char* out, size_t out_size) {
-	if (eta_sec <= 0) {
-		out[0] = '\0';
-		return;
-	}
-	if (eta_sec >= 3600)
-		snprintf(out, out_size, "%d:%02d:%02d", eta_sec / 3600, (eta_sec % 3600) / 60, eta_sec % 60);
-	else if (eta_sec >= 60)
-		snprintf(out, out_size, "%d:%02d", eta_sec / 60, eta_sec % 60);
-	else
-		snprintf(out, out_size, "%ds", eta_sec);
-}
 
 static void render_update_page(SDL_Surface* screen, const char* title,
 							   const char* status, int progress_pct,
@@ -592,13 +430,13 @@ static int fetch_release_details(SDL_Surface* screen, ReleaseInfo* release) {
 		ReleaseInfo api = {0};
 		if (json_extract_string(data, "tag_name", api.tag_name,
 								sizeof(api.tag_name)) &&
-			find_zip_asset_url(data, get_asset_suffix(), api.download_url,
-							   sizeof(api.download_url),
-							   api.expected_sha256, sizeof(api.expected_sha256))) {
+			updater_find_zip_asset_url(data, get_asset_suffix(), api.download_url,
+									   sizeof(api.download_url),
+									   api.expected_sha256, sizeof(api.expected_sha256))) {
 			char body[4096] = "";
 			json_extract_string(data, "body", body, sizeof(body));
-			extract_first_paragraph(body, api.release_notes,
-									sizeof(api.release_notes));
+			updater_extract_first_paragraph(body, api.release_notes,
+											sizeof(api.release_notes));
 			*release = api;
 			free(data);
 			return 1;
@@ -743,11 +581,7 @@ static void do_install(SDL_Surface* screen, ReleaseInfo* release) {
 	unlink(DOWNLOAD_PATH);
 
 	// Start download in background thread via wget_download_file
-	memset(&dl_ctx, 0, sizeof(dl_ctx));
-	snprintf(dl_ctx.url, sizeof(dl_ctx.url), "%s", release->download_url);
-	snprintf(dl_ctx.filepath, sizeof(dl_ctx.filepath), "%s", DOWNLOAD_PATH);
-
-	if (pthread_create(&tid, NULL, download_thread_func, NULL) != 0) {
+	if (!wget_job_start(&dl_ctx, release->download_url, DOWNLOAD_PATH, 0)) {
 		PWR_enableSleep();
 		PWR_enableAutosleep();
 		system("iw dev wlan0 set power_save on 2>/dev/null");
@@ -765,7 +599,7 @@ static void do_install(SDL_Surface* screen, ReleaseInfo* release) {
 		// Cancel
 		if (PAD_justPressed(BTN_B)) {
 			dl_ctx.cancel = true;
-			pthread_join(tid, NULL);
+			wget_job_join(&dl_ctx);
 			unlink(DOWNLOAD_PATH);
 			cancelled = 1;
 			break;
@@ -784,15 +618,15 @@ static void do_install(SDL_Surface* screen, ReleaseInfo* release) {
 
 		char speed_str[32] = "";
 		char eta_str[32] = "";
-		format_speed(speed_bps, speed_str, sizeof(speed_str));
-		format_eta(eta_sec, eta_str, sizeof(eta_str));
+		wget_format_speed(speed_bps, speed_str, sizeof(speed_str));
+		wget_format_eta(eta_sec, eta_str, sizeof(eta_str));
 
 		render_update_page(screen, "Downloading Update",
 						   dl_status, progress_pct, speed_str, eta_str, 1);
 	}
 
 	if (!cancelled) {
-		pthread_join(tid, NULL);
+		wget_job_join(&dl_ctx);
 		dl_success = (dl_ctx.result > 0);
 	}
 

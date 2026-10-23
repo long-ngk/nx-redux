@@ -249,6 +249,68 @@ static void test_unknown_value_roundtrip(void) {
 	emu_ovl_cfg_free(&cfg);
 }
 
+// 9. Duplicate keys in one layer: the FIRST line wins, as in minarch's
+//    Config_getValue (the editor used to show the last one while the game ran
+//    with the first). A lock marker only counts on the first line too.
+static void test_duplicate_first_wins(void) {
+	reset_root();
+	write_file(ROOT "/cfgdir/minarch.cfg",
+			   "tc_frameskip = auto\ntc_frameskip = manual\ntc_ratio = 16:9\n-tc_ratio = 4:3\n");
+	static EmuOvlConfig cfg;
+	static OptsMinarchState st;
+	static OptsOverrideState ost;
+	load(&cfg, &st, &ost, NULL, NULL, NULL);
+	assert(cfg.sections[0].item_count == 2);			 // the later "-tc_ratio" does not lock it
+	assert(cfg.sections[0].items[0].current_value == 1); // auto, not manual
+	assert(cfg.sections[0].items[1].current_value == 1); // 16:9
+	opts_minarch_free(&st);
+	emu_ovl_cfg_free(&cfg);
+}
+
+// 10. CRLF cfg (edited on a PC): values read without the '\r', locks still
+//     seen, and a value's other bytes are not trimmed (minarch keeps them).
+static void test_crlf(void) {
+	reset_root();
+	write_file(ROOT "/default.cfg", "-tc_ratio = 16:9\r\n");
+	write_file(ROOT "/cfgdir/minarch.cfg", "tc_frameskip = manual\r\n");
+	static EmuOvlConfig cfg;
+	static OptsMinarchState st;
+	static OptsOverrideState ost;
+	load(&cfg, &st, &ost, NULL, ROOT "/default.cfg", NULL);
+	assert(cfg.sections[0].item_count == 1);
+	assert(strcmp(cfg.sections[0].items[0].key, "tc_frameskip") == 0);
+	assert(cfg.sections[0].items[0].current_value == 2); // manual, no stray '\r' value interned
+	assert(cfg.sections[0].items[0].value_count == 3);
+	opts_minarch_free(&st);
+	emu_ovl_cfg_free(&cfg);
+}
+
+// 11. A line longer than the parser's 1024-byte line buffer (a frontend value the
+// editor does not own) is copied through a save byte for byte, and the lines
+// after it still parse.
+static void test_long_line_passthrough(void) {
+	reset_root();
+	static char content[4096];
+	char longval[2000];
+	memset(longval, 'v', sizeof(longval) - 1);
+	longval[sizeof(longval) - 1] = '\0';
+	snprintf(content, sizeof(content), "minarch_long = %s\ntc_frameskip = auto\n", longval);
+	write_file(ROOT "/cfgdir/minarch.cfg", content);
+	static EmuOvlConfig cfg;
+	static OptsMinarchState st;
+	static OptsOverrideState ost;
+	load(&cfg, &st, &ost, NULL, NULL, NULL);
+	assert(cfg.sections[0].items[0].current_value == 1); // auto, read past the long line
+	cfg.sections[0].items[0].staged_value = 2;			 // manual
+	assert(opts_minarch_save(&cfg, &st, &ost) == 0);
+	char* out = slurp(ROOT "/cfgdir/minarch.cfg");
+	char want[4096];
+	snprintf(want, sizeof(want), "minarch_long = %s\ntc_frameskip = manual\n", longval);
+	assert(strcmp(out, want) == 0);
+	opts_minarch_free(&st);
+	emu_ovl_cfg_free(&cfg);
+}
+
 int main(void) {
 	test_layering();
 	test_game_replaces_console();
@@ -258,6 +320,9 @@ int main(void) {
 	test_pergame_redundancy();
 	test_device_suffix();
 	test_unknown_value_roundtrip();
+	test_duplicate_first_wins();
+	test_crlf();
+	test_long_line_passthrough();
 	printf("test_opts_minarch: all tests passed\n");
 	return 0;
 }

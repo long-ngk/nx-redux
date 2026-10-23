@@ -1,4 +1,5 @@
 #include "ma_cheat_match.h"
+#include "../common/str_trim.h"
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
@@ -29,17 +30,6 @@ static void cm_lower(char* s) {
 		*s = (char)tolower((unsigned char)*s);
 }
 
-static void cm_trim(char* s) {
-	size_t n = strlen(s);
-	while (n && isspace((unsigned char)s[n - 1]))
-		s[--n] = '\0';
-	size_t i = 0;
-	while (s[i] && isspace((unsigned char)s[i]))
-		i++;
-	if (i)
-		memmove(s, s + i, strlen(s + i) + 1);
-}
-
 // A parsed filename: stem plus classified tokens.
 typedef struct {
 	char stem[CM_STEM_LEN];				   // text before first " (", trimmed
@@ -59,7 +49,7 @@ static void cm_strip_cht(char* s) {
 static void cm_add_token(CmParsed* p, const char* raw) {
 	char tok[CM_TOK_LEN];
 	snprintf(tok, sizeof(tok), "%s", raw);
-	cm_trim(tok);
+	strTrimSpaceInPlace(tok);
 	if (tok[0] == '\0')
 		return;
 	char lc[CM_TOK_LEN];
@@ -92,7 +82,7 @@ static const char* cm_region_word(const char* lc) {
 static void cm_add_bracket(CmParsed* p, const char* raw) {
 	char lc[CM_TOK_LEN];
 	snprintf(lc, sizeof(lc), "%s", raw);
-	cm_trim(lc);
+	strTrimSpaceInPlace(lc);
 	cm_lower(lc);
 	if (lc[0] == '\0')
 		return;
@@ -132,7 +122,7 @@ static void cm_parse(const char* basename, CmParsed* p) {
 	} else {
 		snprintf(p->stem, sizeof(p->stem), "%s", work);
 	}
-	cm_trim(p->stem);
+	strTrimSpaceInPlace(p->stem);
 
 	// walk each "( ... )" group; split its contents on ", "
 	const char* s = work;
@@ -221,6 +211,34 @@ static void cm_group_key(const CmParsed* p, char* out, size_t out_len) {
 		used += (size_t)snprintf(out + used, out_len - used, "%s,", p->quals[order[i]]);
 }
 
+// The stem folded to lowercase letters and digits ("Marvel Vs. Capcom 2" ->
+// "marvelvscapcom2"), so spellings that differ only in spaces and punctuation compare equal.
+static void cm_loose(const char* stem, char* out, size_t out_len) {
+	size_t n = 0;
+	for (; *stem && n + 1 < out_len; stem++)
+		if (isalnum((unsigned char)*stem))
+			out[n++] = (char)tolower((unsigned char)*stem);
+	out[n] = '\0';
+}
+
+void CheatMatch_looseStem(const char* name, char* out, size_t out_len) {
+	CmParsed p;
+	cm_parse(name, &p);
+	cm_loose(p.stem, out, out_len);
+}
+
+// 0 for a USA file, 1 World, 2 Europe, 3 anything else: the tie-break when the
+// ROM's own name gives no region to go by.
+static int cm_region_pref(const CmParsed* p) {
+	static const char* const pref[] = {"usa", "world", "europe"};
+	int best = 3;
+	for (int i = 0; i < p->nquals; i++)
+		for (int k = 0; k < best; k++)
+			if (strcmp(p->quals[i], pref[k]) == 0)
+				best = k;
+	return best;
+}
+
 void CheatMatch_sourceLabel(const char* basename, char* out, size_t out_len) {
 	CmParsed p;
 	cm_parse(basename, &p);
@@ -239,7 +257,7 @@ int CheatMatch_select(const char* rom_display, const char* rom_fullname,
 	// authoritative stem for the exact-match gate.
 	char rom_stem[CM_STEM_LEN];
 	snprintf(rom_stem, sizeof(rom_stem), "%s", rom_display);
-	cm_trim(rom_stem);
+	strTrimSpaceInPlace(rom_stem);
 
 	// Parse candidates; qualify those whose stem == rom_display (case-insensitive).
 	CmParsed* cp = calloc((size_t)n, sizeof(CmParsed));
@@ -258,17 +276,33 @@ int CheatMatch_select(const char* rom_display, const char* rom_fullname,
 		if (qualified[i])
 			any = 1;
 	}
+	// No exact stem: compare letters and digits only, so "Soulcalibur" finds
+	// "Soul Calibur" and "Marvel vs Capcom 2" finds "Marvel Vs. Capcom 2".
+	if (!any) {
+		char rom_loose[CM_STEM_LEN];
+		cm_loose(rom_stem, rom_loose, sizeof(rom_loose));
+		for (int i = 0; i < n && rom_loose[0]; i++) {
+			char loose[CM_STEM_LEN];
+			cm_loose(cp[i].stem, loose, sizeof(loose));
+			qualified[i] = (strcmp(loose, rom_loose) == 0);
+			if (qualified[i])
+				any = 1;
+		}
+	}
 	if (!any) {
 		free(cp);
 		free(qualified);
 		return 0;
 	}
 
-	// Choose the winning group: max region overlap, then min extra qualifier
-	// tokens (those the candidate has but the ROM lacks), then a retail disc
-	// serial, then lexically smallest group key for determinism.
+	// Choose the winning group: max region overlap; then a group with a file
+	// that has no source tag (a lone "(Rumbles)" pack has no region tokens, so
+	// it used to win the next step over the full "(USA)" set); then min extra
+	// qualifier tokens (those the candidate has but the ROM lacks); then a
+	// retail disc serial; then USA, World, Europe; then the lexically smallest
+	// group key for determinism.
 	char best_key[CM_STEM_LEN + CM_MAX_TOKENS * (CM_TOK_LEN + 1)] = {0};
-	int best_overlap = -1, best_extra = 0, best_serial = 0, have_best = 0;
+	int best_overlap = -1, best_plain = 0, best_extra = 0, best_serial = 0, best_pref = 0, have_best = 0;
 
 	for (int i = 0; i < n; i++) {
 		if (!qualified[i])
@@ -276,26 +310,41 @@ int CheatMatch_select(const char* rom_display, const char* rom_fullname,
 		int overlap = cm_qual_overlap(&rom, &cp[i]);
 		int extra = cp[i].nquals - overlap; // qualifier tokens not in the ROM
 		int serial = cm_has_serial(&cp[i]);
+		int pref = cm_region_pref(&cp[i]);
 		char key[sizeof(best_key)];
 		cm_group_key(&cp[i], key, sizeof(key));
+		int plain = 0;
+		for (int j = 0; j < n && !plain; j++) {
+			if (!qualified[j] || cp[j].source[0] != '\0')
+				continue;
+			char other[sizeof(best_key)];
+			cm_group_key(&cp[j], other, sizeof(other));
+			plain = (strcmp(other, key) == 0);
+		}
 
 		int better = 0;
 		if (!have_best)
 			better = 1;
 		else if (overlap != best_overlap)
 			better = (overlap > best_overlap);
+		else if (plain != best_plain)
+			better = plain;
 		else if (extra != best_extra)
 			better = (extra < best_extra);
 		else if (serial != best_serial)
 			better = serial;
+		else if (pref != best_pref)
+			better = (pref < best_pref);
 		else
 			better = (strcmp(key, best_key) < 0);
 
 		if (better) {
 			have_best = 1;
 			best_overlap = overlap;
+			best_plain = plain;
 			best_extra = extra;
 			best_serial = serial;
+			best_pref = pref;
 			snprintf(best_key, sizeof(best_key), "%s", key);
 		}
 	}
@@ -321,4 +370,31 @@ int CheatMatch_select(const char* rom_display, const char* rom_fullname,
 	free(cp);
 	free(qualified);
 	return count;
+}
+
+void CheatMatch_consoleFolders(const char* tag, const char* rom_path, const char** first,
+							   const char** second) {
+	static const char* const same_console[][2] = {
+		{"MGBA", "GBA"}, {"SUPA", "SFC"}, {"PSX", "PS"}, {"DCX", "DC"}, {NULL, NULL}};
+	*first = tag;
+	*second = NULL;
+	for (int i = 0; same_console[i][0]; i++)
+		if (strcmp(tag, same_console[i][0]) == 0)
+			*first = same_console[i][1];
+
+	if (strcmp(tag, "GB") == 0)
+		*second = "GBC";
+	else if (strcmp(tag, "GBC") == 0)
+		*second = "GB";
+	else if (strcmp(tag, "GPGX") == 0) {
+		static const char* const by_ext[][2] = {
+			{"gg", "GG"}, {"sms", "SMS"}, {"sg", "SG1000"}, {"sc", "SG1000"}, {"cue", "SEGACD"}, {"chd", "SEGACD"}, {"iso", "SEGACD"}, {"m3u", "SEGACD"}, {NULL, NULL}};
+		*first = "MD";
+		const char* dot = rom_path ? strrchr(rom_path, '.') : NULL;
+		const char* slash = rom_path ? strrchr(rom_path, '/') : NULL;
+		if (dot && (!slash || dot > slash))
+			for (int i = 0; by_ext[i][0]; i++)
+				if (strcasecmp(dot + 1, by_ext[i][0]) == 0)
+					*first = by_ext[i][1];
+	}
 }

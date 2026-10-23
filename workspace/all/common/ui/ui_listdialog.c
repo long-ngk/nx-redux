@@ -1,5 +1,6 @@
 #include "ui_listdialog.h"
 #include "ui_list.h"
+#include "list_nav.h"
 #include "ui_accent.h"
 #include "ui_buttonhintbar.h"
 #include "ui_menubar.h"
@@ -11,7 +12,6 @@
 #include <stdlib.h>
 
 static char dialog_title[128];
-static char dialog_status[128];
 // a copy of the caller's rows, any number of them (LISTDIALOG_MAX_ITEMS is only a size for callers' own arrays)
 static ListDialogItem* dialog_items = NULL;
 static int dialog_count;
@@ -21,7 +21,6 @@ static int dialog_scroll;
 void ListDialog_init(const char* title) {
 	strncpy(dialog_title, title, sizeof(dialog_title) - 1);
 	dialog_title[sizeof(dialog_title) - 1] = '\0';
-	dialog_status[0] = '\0';
 	dialog_count = 0;
 	dialog_selected = 0;
 	dialog_scroll = 0;
@@ -42,20 +41,7 @@ void ListDialog_setItems(ListDialogItem* items, int count) {
 		}
 	}
 	dialog_count = count;
-
-	if (dialog_selected >= dialog_count)
-		dialog_selected = dialog_count > 0 ? dialog_count - 1 : 0;
-	if (dialog_scroll > dialog_selected)
-		dialog_scroll = dialog_selected;
-}
-
-void ListDialog_setStatus(const char* status) {
-	if (status) {
-		strncpy(dialog_status, status, sizeof(dialog_status) - 1);
-		dialog_status[sizeof(dialog_status) - 1] = '\0';
-	} else {
-		dialog_status[0] = '\0';
-	}
+	ListNav_clampSelection(dialog_count, &dialog_selected, &dialog_scroll);
 }
 
 ListDialogResult ListDialog_handleInput(void) {
@@ -181,24 +167,7 @@ void ListDialog_render(SDL_Surface* screen) {
 	GFX_clearLayers(LAYER_SCROLLTEXT);
 	SDL_FillRect(screen, NULL, SDL_MapRGB(screen->format, 0, 0, 0));
 
-	int hw = screen->w;
-
 	UI_renderMenuBar(screen, dialog_title);
-
-	// Status text (if set and no items)
-	if (dialog_status[0] && dialog_count == 0) {
-		int status_h = TTF_FontHeight(font.small);
-		int status_y = (screen->h - status_h) / 2;
-		SDL_Surface* status_surf = GFX_renderText(font.small, dialog_status, COLOR_GRAY);
-		if (status_surf) {
-			int status_x = (hw - status_surf->w) / 2;
-			SDL_BlitSurface(status_surf, NULL, screen,
-							&(SDL_Rect){status_x, status_y, 0, 0});
-			SDL_FreeSurface(status_surf);
-		}
-		UI_renderButtonHintBar(screen, (char*[]){"B", "BACK", NULL});
-		return;
-	}
 
 	if (dialog_count == 0) {
 		UI_renderButtonHintBar(screen, (char*[]){"B", "BACK", NULL});
@@ -234,5 +203,4 @@ void ListDialog_quit(void) {
 	dialog_selected = 0;
 	dialog_scroll = 0;
 	dialog_title[0] = '\0';
-	dialog_status[0] = '\0';
 }

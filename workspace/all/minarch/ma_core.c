@@ -2,6 +2,7 @@
 #include "utils.h"
 #include "ma_core.h"
 #include "ma_cheats.h"
+#include "ma_cheat_match.h"
 #include "ra_integration.h"
 #include "ma_saves.h"
 #include "ma_input.h"
@@ -151,7 +152,12 @@ void Core_open(const char* core_path, const char* tag_name) {
 		else
 			sprintf((char*)core.bios_dir, "%s/Bios/%s", SDCARD_PATH, core.tag);
 	}
-	sprintf((char*)core.cheats_dir, "%s/Cheats/%s", SDCARD_PATH, core.tag);
+	{
+		// the console's folder, shared by its cores (Cheats_load refines it per ROM)
+		const char *cheats, *cheats_second;
+		CheatMatch_consoleFolders(core.tag, NULL, &cheats, &cheats_second);
+		sprintf((char*)core.cheats_dir, "%s/Cheats/%s", SDCARD_PATH, cheats);
+	}
 	sprintf((char*)core.overlays_dir, "%s/Overlays/%s", SDCARD_PATH, core.tag);
 
 	mkdir_p(core.config_dir);
@@ -271,7 +277,7 @@ void Core_load(void) {
 		// running a core with no loaded game is a guaranteed crash inside the core
 		LOG_error("core refused to load game: %s\n", game_info.path);
 		if (CoreNetplay_isActive()) // the core gave up waiting for the peer
-			Menu_netplayNotice("Netplay failed", "Couldn't connect to the other player.", 3000);
+			Menu_notice("Netplay failed", "Couldn't connect to the other player.", 3000);
 		exit(EXIT_FAILURE);
 	}
 	{
@@ -306,12 +312,6 @@ void Core_reset(void) {
 	// the undo snapshot belongs to the abandoned pre-reset session
 	State_invalidateUndo();
 	Rewind_on_state_change();
-}
-void Core_unload(void) {
-	// Disabling this is a dumb hack for bluetooth, we should really be using
-	// bluealsa with --keep-alive=-1 - but SDL wont reconnect the stream on next start.
-	// Reenable as soon as we have a more recent SDL available, if ever.
-	//SND_quit();
 }
 void Core_quit(void) {
 	if (core.initialized) {

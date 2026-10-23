@@ -12,6 +12,9 @@
 
 #include "../musicplayer/music_balance.h"
 #include "../musicplayer/music_client.h"
+#include "osdmusic_config.h"
+#include "../common/proc_util.h"
+#include "../common/settings_kv.h"
 #if defined(PLATFORM_TG5050)
 #include "../../tg5050/libmsettings/msettings.h"
 #else
@@ -100,20 +103,12 @@ static void load_accent(void) {
 		return;
 	accent_mtime = st.st_mtime;
 	SDL_Color next = {54, 255, 160, 255};
-	FILE* f = fopen(THEME_SETTINGS_PATH, "r");
-	if (f) {
-		char line[128];
-		while (fgets(line, sizeof(line), f)) {
-			unsigned value;
-			if (sscanf(line, "color2=0x%x", &value) == 1 || sscanf(line, "color2=0X%x", &value) == 1) {
-				if (value == 0x002222ffU)
-					value = 0x006666ffU;
-				Uint8 r = (value >> 24) & 0xff, g = (value >> 16) & 0xff, b = (value >> 8) & 0xff;
-				next = (SDL_Color){r, g, b, 255};
-				break;
-			}
-		}
-		fclose(f);
+	unsigned value;
+	if (settings_kv_hex(THEME_SETTINGS_PATH, "color2", &value)) {
+		if (value == 0x002222ffU)
+			value = 0x006666ffU;
+		Uint8 r = (value >> 24) & 0xff, g = (value >> 16) & 0xff, b = (value >> 8) & 0xff;
+		next = (SDL_Color){r, g, b, 255};
 	}
 	accent = next;
 }
@@ -213,22 +208,7 @@ static SDL_Surface* load_png(const char* name, int size) {
 	return load_png_path(path, size, size);
 }
 
-// Pull "key" : number out of the widget's config.json (flat JSON, no nesting).
-static int config_int(const char* json, const char* key, int fallback) {
-	char needle[64];
-	snprintf(needle, sizeof(needle), "\"%s\"", key);
-	const char* at = strstr(json, needle);
-	if (!at)
-		return fallback;
-	at = strchr(at + strlen(needle), ':');
-	if (!at)
-		return fallback;
-	int value = fallback;
-	if (sscanf(at + 1, " %d", &value) != 1)
-		return fallback;
-	return value;
-}
-
+// Canvas and grid size from the widget's config.json (flat JSON, no nesting).
 static void load_geometry(void) {
 	FILE* f = fopen(CONFIG_PATH, "r");
 	if (!f)
@@ -237,10 +217,10 @@ static void load_geometry(void) {
 	size_t n = fread(json, 1, sizeof(json) - 1, f);
 	fclose(f);
 	json[n] = '\0';
-	CANVAS_W = config_int(json, "canvaswidth", CANVAS_W);
-	CANVAS_H = config_int(json, "canvasheight", CANVAS_H);
-	GRID_W = config_int(json, "gridwidth", GRID_W);
-	GRID_H = config_int(json, "gridheight", GRID_H);
+	CANVAS_W = osdmusic_config_int(json, "canvaswidth", CANVAS_W);
+	CANVAS_H = osdmusic_config_int(json, "canvasheight", CANVAS_H);
+	GRID_W = osdmusic_config_int(json, "gridwidth", GRID_W);
+	GRID_H = osdmusic_config_int(json, "gridheight", GRID_H);
 }
 
 // Widget background: the cover art scaled to fill the tile, dimmed, and
@@ -363,36 +343,10 @@ static void draw_button(Widget* w, SDL_Surface* icon, int cx, int cy, int disc, 
 	}
 }
 
-// pidof without spawning a shell: scan /proc/*/comm.
-static bool process_running(const char* comm_name) {
-	DIR* proc = opendir("/proc");
-	if (!proc)
-		return false;
-	bool found = false;
-	struct dirent* entry;
-	while (!found && (entry = readdir(proc))) {
-		if (entry->d_name[0] < '0' || entry->d_name[0] > '9')
-			continue;
-		char path[64];
-		snprintf(path, sizeof(path), "/proc/%s/comm", entry->d_name);
-		FILE* f = fopen(path, "r");
-		if (!f)
-			continue;
-		char comm[64] = {0};
-		if (fgets(comm, sizeof(comm), f)) {
-			comm[strcspn(comm, "\n")] = '\0';
-			found = strcmp(comm, comm_name) == 0;
-		}
-		fclose(f);
-	}
-	closedir(proc);
-	return found;
-}
-
 static void request_music_player(void) {
 	// Only the launcher consumes the request; while a game or another tool is
 	// in the foreground there is nothing to hand the pak to.
-	if (!process_running(LAUNCHER_PROCESS))
+	if (!proc_running(LAUNCHER_PROCESS))
 		return;
 	FILE* f = fopen(OPEN_PAK_REQUEST_PATH, "w");
 	if (!f)

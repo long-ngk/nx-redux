@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <setjmp.h>
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -16,41 +17,36 @@
 #include <linux/fb.h>
 
 #include "../common/drm_scanout.h"
+#include "../common/capture_defs.h"
+#include "../common/file_util.h"
+#include "../common/proc_spawn.h"
 
 #define PID_FILE "/tmp/screenrecorder.pid"
-#define SHM_PATH "/tmp/fb_mirror.raw"
-#define FFMPEG_PATH "/usr/bin/ffmpeg"
 #define FRAME_INTERVAL_NS 33333333LL // ~30fps
 
-static volatile int quit = 0;
+static volatile sig_atomic_t quit = 0;
 
 static void on_term(int sig) {
 	(void)sig;
 	quit = 1;
 }
 
-static void mkdir_p(const char* path) {
-	char tmp[512];
-	snprintf(tmp, sizeof(tmp), "%s", path);
-	for (char* p = tmp + 1; *p; p++) {
-		if (*p == '/') {
-			*p = '\0';
-			mkdir(tmp, 0755);
-			*p = '/';
-		}
-	}
-	mkdir(tmp, 0755);
-}
+// SIGBUS: the mirror's owner re-opens it with O_TRUNC (same inode) when an
+// app starts, so a page of our mapping can vanish mid-copy. Inside
+// mirror_copy that just drops the frame; anywhere else (and for SIGSEGV) the
+// PID file goes before the default action, so the OSD doesn't keep showing a
+// recording that died.
+static sigjmp_buf copy_jmp;
+static volatile sig_atomic_t in_copy = 0;
 
-// Ensure output directory exists (create parent dirs of output file)
-static void ensure_output_dir(const char* filepath) {
-	char dir[512];
-	snprintf(dir, sizeof(dir), "%s", filepath);
-	char* last_slash = strrchr(dir, '/');
-	if (last_slash) {
-		*last_slash = '\0';
-		mkdir_p(dir);
+static void on_fault(int sig) {
+	if (sig == SIGBUS && in_copy) {
+		in_copy = 0;
+		siglongjmp(copy_jmp, 1);
 	}
+	unlink(PID_FILE);
+	signal(sig, SIG_DFL);
+	raise(sig);
 }
 
 static int64_t mono_ns(void) {
@@ -60,12 +56,7 @@ static int64_t mono_ns(void) {
 }
 
 // --- fbdev source (tg5040) ------------------------------------------------
-// On tg5040 the PowerVR fbdev EGL (SDL's "mali" fbdev backend) renders straight into fb0, so the visible
-// pane IS the screen. On tg5050 fb0 is never scanned out (stays black) —
-// never use this source there.
-static int fbdev_usable(void) {
-	return strcmp(PLATFORM, "tg5050") != 0;
-}
+// tg5040 only: see fbdev_usable (capture_defs.h).
 
 static int fbdev_fd = -1;
 
@@ -136,7 +127,7 @@ static void mirror_unmap(void) {
 // Returns 1 when a valid mapping exists.
 static int mirror_map(size_t frame_size) {
 	struct stat st;
-	if (stat(SHM_PATH, &st) != 0 || (size_t)st.st_size < frame_size) {
+	if (stat(FB_MIRROR_PATH, &st) != 0 || (size_t)st.st_size < frame_size) {
 		// Path gone (app transition): drop the mapping so we don't stream a
 		// dead inode; the caller keeps sending its last-good frame meanwhile.
 		mirror_unmap();
@@ -145,7 +136,7 @@ static int mirror_map(size_t frame_size) {
 	if (mirror_ptr && st.st_ino == mirror_ino)
 		return 1;
 	mirror_unmap();
-	int fd = open(SHM_PATH, O_RDONLY);
+	int fd = open(FB_MIRROR_PATH, O_RDONLY);
 	if (fd < 0)
 		return 0;
 	struct stat fst;
@@ -162,6 +153,25 @@ static int mirror_map(size_t frame_size) {
 	mirror_ptr = ptr;
 	mirror_size = frame_size;
 	mirror_ino = fst.st_ino;
+	return 1;
+}
+
+// Copies the current mirror frame into dst. Returns 0 (and drops the
+// mapping, to be re-made by mirror_map) when the file shrank under us.
+static int mirror_copy(uint8_t* dst, size_t frame_size) {
+	struct stat st;
+	if (fstat(mirror_fd, &st) != 0 || (size_t)st.st_size < frame_size) {
+		mirror_unmap();
+		return 0;
+	}
+	// truncated between the fstat and the copy: SIGBUS lands back here
+	if (sigsetjmp(copy_jmp, 1)) {
+		mirror_unmap();
+		return 0;
+	}
+	in_copy = 1;
+	memcpy(dst, mirror_ptr, frame_size);
+	in_copy = 0;
 	return 1;
 }
 
@@ -192,6 +202,10 @@ int main(int argc, char* argv[]) {
 	// The encoder pipe can break if ffmpeg dies; take that as a write error,
 	// not a process kill.
 	signal(SIGPIPE, SIG_IGN);
+	struct sigaction fault = {0};
+	fault.sa_handler = on_fault;
+	sigaction(SIGBUS, &fault, NULL);
+	sigaction(SIGSEGV, &fault, NULL);
 
 	// Write PID file
 	FILE* pf = fopen(PID_FILE, "w");
@@ -200,7 +214,7 @@ int main(int argc, char* argv[]) {
 		fclose(pf);
 	}
 
-	ensure_output_dir(output_path);
+	mkdir_parent_mode(output_path, 0755); // create parent dirs of the output file
 
 	// Pick a source. DRM scanout (tg5050) and fbdev (tg5040) both record the
 	// real screen for ANY app — including third-party paks — and follow the
@@ -228,7 +242,7 @@ int main(int argc, char* argv[]) {
 			usleep(33333);
 		}
 		if (!found || quit) {
-			fprintf(stderr, "No capture source (no DRM planes, no fbdev, no %s)\n", SHM_PATH);
+			fprintf(stderr, "No capture source (no DRM planes, no fbdev, no %s)\n", FB_MIRROR_PATH);
 			mirror_unmap();
 			remove(PID_FILE);
 			return 1;
@@ -266,9 +280,38 @@ int main(int argc, char* argv[]) {
 	// fixed 30fps (and paks often cap the CPU clocks), so frame-count
 	// timestamps would make the video play too fast. With VFR the timeline
 	// is correct at whatever rate the device achieves, and unchanged frames
-	// can simply be skipped. DRM scanout frames are top-down bgr0/rgb0;
-	// mirror frames are bottom-up RGBA from glReadPixels (vflip at encode).
-	pid_t ffmpeg_pid = fork();
+	// can simply be skipped. DRM scanout: top-down bgr0/rgb0. fbdev: top-down bgr0 (alpha byte
+	// ignored). Mirror: bottom-up RGBA from glReadPixels → vflip.
+	char* pixfmt = src == SRC_DRM	  ? drm_info.pixfmt
+				   : src == SRC_FBDEV ? "bgr0"
+									  : "rgba";
+	char* out = (char*)output_path;
+	char* mirror_argv[] = {FFMPEG_PATH, "-nostdin",
+						   "-use_wallclock_as_timestamps", "1",
+						   "-f", "rawvideo", "-pixel_format", pixfmt,
+						   "-video_size", video_size,
+						   "-i", "pipe:0",
+						   "-vf", "vflip",
+						   "-c:v", "mjpeg", "-q:v", "10", "-pix_fmt", "yuvj420p",
+						   "-fps_mode", "vfr",
+						   // fragmented mp4: file stays playable even if we're SIGKILLed
+						   "-movflags", "+frag_keyframe+empty_moov",
+						   "-y", out,
+						   NULL};
+	char* scanout_argv[] = {FFMPEG_PATH, "-nostdin",
+							"-use_wallclock_as_timestamps", "1",
+							"-f", "rawvideo", "-pixel_format", pixfmt,
+							"-video_size", video_size,
+							"-i", "pipe:0",
+							"-c:v", "mjpeg", "-q:v", "10", "-pix_fmt", "yuvj420p",
+							"-fps_mode", "vfr",
+							"-movflags", "+frag_keyframe+empty_moov",
+							"-y", out,
+							NULL};
+	// The write end stays ours: closed on exec in the child, so ffmpeg sees
+	// EOF when we close it.
+	fcntl(pipe_fds[1], F_SETFD, FD_CLOEXEC);
+	pid_t ffmpeg_pid = spawn_quiet(src == SRC_MIRROR ? mirror_argv : scanout_argv, pipe_fds[0], false);
 	if (ffmpeg_pid < 0) {
 		perror("fork");
 		close(pipe_fds[0]);
@@ -278,46 +321,6 @@ int main(int argc, char* argv[]) {
 		mirror_unmap();
 		remove(PID_FILE);
 		return 1;
-	}
-
-	if (ffmpeg_pid == 0) {
-		// ffmpeg child
-		close(pipe_fds[1]); // close write end
-		dup2(pipe_fds[0], STDIN_FILENO);
-		close(pipe_fds[0]);
-		freopen("/dev/null", "w", stdout);
-		freopen("/dev/null", "w", stderr);
-		// DRM scanout: top-down bgr0/rgb0. fbdev: top-down bgr0 (alpha byte
-		// ignored). Mirror: bottom-up RGBA from glReadPixels → vflip.
-		const char* pixfmt = src == SRC_DRM		? drm_info.pixfmt
-							 : src == SRC_FBDEV ? "bgr0"
-												: "rgba";
-		if (src == SRC_MIRROR) {
-			execl(FFMPEG_PATH, "ffmpeg", "-nostdin",
-				  "-use_wallclock_as_timestamps", "1",
-				  "-f", "rawvideo", "-pixel_format", pixfmt,
-				  "-video_size", video_size,
-				  "-i", "pipe:0",
-				  "-vf", "vflip",
-				  "-c:v", "mjpeg", "-q:v", "10", "-pix_fmt", "yuvj420p",
-				  "-fps_mode", "vfr",
-				  // fragmented mp4: file stays playable even if we're SIGKILLed
-				  "-movflags", "+frag_keyframe+empty_moov",
-				  "-y", output_path,
-				  (char*)NULL);
-		} else {
-			execl(FFMPEG_PATH, "ffmpeg", "-nostdin",
-				  "-use_wallclock_as_timestamps", "1",
-				  "-f", "rawvideo", "-pixel_format", pixfmt,
-				  "-video_size", video_size,
-				  "-i", "pipe:0",
-				  "-c:v", "mjpeg", "-q:v", "10", "-pix_fmt", "yuvj420p",
-				  "-fps_mode", "vfr",
-				  "-movflags", "+frag_keyframe+empty_moov",
-				  "-y", output_path,
-				  (char*)NULL);
-		}
-		_exit(1);
 	}
 
 	// Parent: close read end of pipe
@@ -351,10 +354,7 @@ int main(int argc, char* argv[]) {
 		} else if (src == SRC_FBDEV) {
 			got = fbdev_read(frame, width, height);
 		} else {
-			if (mirror_map(frame_size)) {
-				memcpy(frame, mirror_ptr, frame_size);
-				got = 1;
-			}
+			got = mirror_map(frame_size) && mirror_copy(frame, frame_size);
 		}
 
 		int64_t now = mono_ns();

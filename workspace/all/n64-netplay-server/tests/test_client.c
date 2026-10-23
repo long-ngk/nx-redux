@@ -3,7 +3,7 @@
  *
  * Spawns ./m64p-server-native on 127.0.0.1:55545 with --players 2, connects
  * real sockets, and drives the wire formats of mupen64plus-core's
- * src/main/netplay.c. Thirteen numbered checks T1-T13; any failure prints "FAIL <n> <name>" and exits 1. The spawned server
+ * src/main/netplay.c. Fifteen numbered checks T1-T15; any failure prints "FAIL <n> <name>" and exits 1. The spawned server
  * is killed in an atexit handler.
  */
 
@@ -593,6 +593,142 @@ static int t13(void) {
 	return 1;
 }
 
+// 1 when the server closes fd (EOF) within timeout_ms.
+static int closed_within(int fd, int timeout_ms) {
+	struct pollfd pf = {.fd = fd, .events = POLLIN, .revents = 0};
+	if (poll(&pf, 1, timeout_ms) <= 0)
+		return 0;
+	uint8_t b;
+	return read(fd, &b, 1) <= 0;
+}
+
+/* T14 save cap: a fresh socket sends [1]"big\0"[u32 MS_SAVE_MAX + 1] and the
+       server closes it without waiting for the blob.                      */
+static int t14(void) {
+	int fd = tcp_connect();
+	if (fd < 0)
+		return 0;
+	uint8_t msg[9] = {1, 'b', 'i', 'g', 0};
+	wr32(&msg[5], MS_SAVE_MAX + 1);
+	int ok = send_all(fd, msg, sizeof(msg)) == 0 && closed_within(fd, RECV_TIMEOUT_MS);
+	close(fd);
+	return ok;
+}
+
+/* T15 connection cap: with --players 2 the server keeps 2 + MS_CONN_SLACK
+       live sockets (A and B are two); one more is closed on accept.        */
+static int t15(void) {
+	int extra[MS_CONN_SLACK + 1];
+	int n = 0, ok = 1;
+	for (; n < MS_CONN_SLACK + 1; ++n) {
+		extra[n] = tcp_connect();
+		if (extra[n] < 0) {
+			ok = 0;
+			break;
+		}
+	}
+	if (ok) {
+		usleep(200 * 1000); // let the server accept them all
+		for (int i = 0; i < MS_CONN_SLACK && ok; ++i)
+			ok = silent_for(extra[i], 300);
+		if (ok && !closed_within(extra[MS_CONN_SLACK], RECV_TIMEOUT_MS)) {
+			fprintf(stderr, "  connection past the cap stayed open\n");
+			ok = 0;
+		}
+	}
+	for (int i = 0; i < n; ++i)
+		close(extra[i]);
+	return ok;
+}
+
+// A fresh socket for one edge-case test. The pause first lets the server see
+// the previous test's socket close, so the connection cap never bites here.
+static int fresh_conn(void) {
+	usleep(150 * 1000);
+	return tcp_connect();
+}
+
+/* T16 split request: [1]"spl\0"[u32 4]"ABCD" arrives in four writes, cut
+       inside the extension and inside the size; then [2]"spl\0" in two
+       writes reads the blob back.                                         */
+static int t16(void) {
+	int fd = fresh_conn();
+	if (fd < 0)
+		return 0;
+	const uint8_t c1[] = {1, 's'}, c2[] = {'p', 'l', 0, 0, 0}, c3[] = {0, 4, 'A', 'B'}, c4[] = {'C', 'D'};
+	const uint8_t r1[] = {2, 's', 'p'}, r2[] = {'l', 0};
+	int ok = send_all(fd, c1, sizeof(c1)) == 0;
+	usleep(50 * 1000);
+	ok = ok && send_all(fd, c2, sizeof(c2)) == 0;
+	usleep(50 * 1000);
+	ok = ok && send_all(fd, c3, sizeof(c3)) == 0;
+	usleep(50 * 1000);
+	ok = ok && send_all(fd, c4, sizeof(c4)) == 0 && send_all(fd, r1, sizeof(r1)) == 0;
+	usleep(50 * 1000);
+	ok = ok && send_all(fd, r2, sizeof(r2)) == 0;
+	uint8_t got[4];
+	ok = ok && recv_all(fd, got, sizeof(got), RECV_TIMEOUT_MS) == 0 && memcmp(got, "ABCD", 4) == 0;
+	close(fd);
+	return ok;
+}
+
+/* T17 batched requests: SEND_SAVE "bat", RECV_SAVE "bat" and RECV_SAVE
+       "spl" in one write; both replies come back, in request order.       */
+static int t17(void) {
+	int fd = fresh_conn();
+	if (fd < 0)
+		return 0;
+	const uint8_t msg[] = {1, 'b', 'a', 't', 0, 0, 0, 0, 2, 'x', 'y', 2, 'b', 'a', 't', 0, 2, 's', 'p', 'l', 0};
+	uint8_t got[6];
+	int ok = send_all(fd, msg, sizeof(msg)) == 0 && recv_all(fd, got, sizeof(got), RECV_TIMEOUT_MS) == 0 &&
+			 memcmp(got, "xyABCD", 6) == 0 && silent_for(fd, 200);
+	close(fd);
+	return ok;
+}
+
+/* T18 extension cap: 16 bytes with no NUL after RECV_SAVE closes the conn. */
+static int t18(void) {
+	int fd = fresh_conn();
+	if (fd < 0)
+		return 0;
+	uint8_t msg[17];
+	msg[0] = 2;
+	memset(&msg[1], 'e', 16);
+	int ok = send_all(fd, msg, sizeof(msg)) == 0 && closed_within(fd, RECV_TIMEOUT_MS);
+	close(fd);
+	return ok;
+}
+
+/* T19 deferred-queue cap: 8 RECV_SAVE for a save nobody sent wait quietly;
+       a 9th closes the conn.                                              */
+static int t19(void) {
+	int fd = fresh_conn();
+	if (fd < 0)
+		return 0;
+	const uint8_t one[] = {2, 'n', 'o', 'p', 'e', 0};
+	uint8_t eight[8 * sizeof(one)];
+	for (int i = 0; i < 8; ++i)
+		memcpy(&eight[i * sizeof(one)], one, sizeof(one));
+	int ok = send_all(fd, eight, sizeof(eight)) == 0 && silent_for(fd, 300);
+	ok = ok && send_all(fd, one, sizeof(one)) == 0 && closed_within(fd, RECV_TIMEOUT_MS);
+	close(fd);
+	return ok;
+}
+
+/* T20 unknown request: request byte 0 and byte 0x42 each close the conn. */
+static int t20(void) {
+	int ok = 1;
+	const uint8_t bad[] = {0, 0x42};
+	for (size_t i = 0; i < sizeof(bad) && ok; ++i) {
+		int fd = fresh_conn();
+		if (fd < 0)
+			return 0;
+		ok = send_all(fd, &bad[i], 1) == 0 && closed_within(fd, RECV_TIMEOUT_MS);
+		close(fd);
+	}
+	return ok;
+}
+
 int main(void) {
 	signal(SIGPIPE, SIG_IGN);
 	atexit(kill_server);
@@ -633,6 +769,13 @@ int main(void) {
 	CHECK(t11(), "T11 count_lag reflects distance behind lead");
 	CHECK(t12(), "T12 desync detection sets status bit 0");
 	CHECK(t13(), "T13 disconnect notice sets player-2 status bit");
+	CHECK(t14(), "T14 save larger than MS_SAVE_MAX closes the conn");
+	CHECK(t15(), "T15 connections past players + slack are refused");
+	CHECK(t16(), "T16 a request split across writes is reassembled");
+	CHECK(t17(), "T17 batched requests are all answered, in order");
+	CHECK(t18(), "T18 a save extension of 16+ bytes closes the conn");
+	CHECK(t19(), "T19 a 9th deferred request closes the conn");
+	CHECK(t20(), "T20 an unknown request byte closes the conn");
 
 	return 0;
 }

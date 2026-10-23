@@ -334,6 +334,48 @@ bool sync_text_lines(const char* text, size_t len, SyncNames* out) {
 	return true;
 }
 
+int sync_read_capped(FILE* fp, size_t max, char** buf, size_t* len) {
+	char* data = NULL;
+	size_t used = 0, cap = 0;
+	char chunk[4096];
+	size_t n;
+	int ret = 0;
+	*buf = NULL;
+	*len = 0;
+	while ((n = fread(chunk, 1, sizeof(chunk), fp)) > 0) {
+		if (used + n > max) {
+			ret = 1;
+			break;
+		}
+		if (used + n + 1 > cap) {
+			size_t want = cap ? cap * 2 : sizeof(chunk) * 2;
+			while (want < used + n + 1)
+				want *= 2;
+			char* grown = realloc(data, want);
+			if (!grown) {
+				ret = -1;
+				break;
+			}
+			data = grown;
+			cap = want;
+		}
+		memcpy(data + used, chunk, n);
+		used += n;
+	}
+	if (ret == 0 && ferror(fp))
+		ret = -1;
+	if (ret == 0 && !data && !(data = malloc(1)))
+		ret = -1;
+	if (ret != 0) {
+		free(data);
+		return ret;
+	}
+	data[used] = '\0';
+	*buf = data;
+	*len = used;
+	return 0;
+}
+
 bool sync_text_is_lines(const char* text, size_t len) {
 	return !memchr(text, '\0', len);
 }
@@ -360,4 +402,58 @@ int sync_merge_lines(const SyncNames* mine, const SyncNames* theirs, SyncNames* 
 		added++;
 	}
 	return added;
+}
+
+int sync_parse_progress2(const char* line, int* transferred, int* done, int* total) {
+	int got = 0;
+	// xfr#N: files actually transferred
+	const char* x = strstr(line, "xfr#");
+	if (x) {
+		int n = 0;
+		if (sscanf(x + 4, "%d", &n) == 1) {
+			*transferred = n;
+			got |= SYNC_PROGRESS_XFR;
+		}
+	}
+
+	// to-chk=X/Y (older rsync: to-check=): remaining/total scanned
+	const char* p = strstr(line, "to-chk=");
+	if (!p)
+		p = strstr(line, "to-check=");
+	if (!p)
+		return got;
+
+	p = strchr(p, '=');
+	if (!p)
+		return got;
+	p++;
+
+	int remaining = 0, all = 0;
+	if (sscanf(p, "%d/%d", &remaining, &all) == 2 && all > 0) {
+		*total = all;
+		*done = all - remaining;
+		got |= SYNC_PROGRESS_CHK;
+	}
+	return got;
+}
+
+char* sync_read_line_cr(char* buf, int size, FILE* fp) {
+	int i = 0;
+	int c;
+	while (i < size - 1) {
+		c = fgetc(fp);
+		if (c == EOF) {
+			if (i == 0)
+				return NULL;
+			break;
+		}
+		if (c == '\r' || c == '\n') {
+			if (i > 0)
+				break;
+			continue; // skip leading \r\n
+		}
+		buf[i++] = (char)c;
+	}
+	buf[i] = '\0';
+	return buf;
 }

@@ -1,9 +1,10 @@
 #include "http.h"
+#include "http_parse.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
+#include <sys/wait.h>
 
 // SDL is used here only for threading (SDL_CreateThread/SDL_DetachThread)
 // to run HTTP requests asynchronously without blocking the main loop.
@@ -13,6 +14,7 @@
 // CA-bundle resolver shared with wget_fetch.c: picks the bundle to verify TLS
 // against, or NULL on a card without one.
 #include "ca_bundle.h"
+#include "utils.h" // shellQuoteAlloc, urlEncode
 
 // Build version info (defined in makefile)
 #ifndef BUILD_HASH
@@ -73,42 +75,9 @@ static void HTTPBuffer_free(HTTPBuffer* buf) {
 	buf->capacity = 0;
 }
 
-// Escape a string for shell use (single quotes)
+// Escape a string for shell use: a malloc'd, single-quoted argument.
 static char* shell_escape(const char* str) {
-	if (!str)
-		return strdup("");
-
-	// Count how many single quotes we need to escape
-	size_t len = strlen(str);
-	size_t quotes = 0;
-	for (size_t i = 0; i < len; i++) {
-		if (str[i] == '\'')
-			quotes++;
-	}
-
-	// Allocate: original + 3 chars per quote ('"'"') + 2 for surrounding quotes + 1 for null
-	char* escaped = malloc(len + quotes * 3 + 3);
-	if (!escaped)
-		return NULL;
-
-	char* p = escaped;
-	*p++ = '\'';
-	for (size_t i = 0; i < len; i++) {
-		if (str[i] == '\'') {
-			// End quote, escaped quote, start quote
-			*p++ = '\'';
-			*p++ = '"';
-			*p++ = '\'';
-			*p++ = '"';
-			*p++ = '\'';
-		} else {
-			*p++ = str[i];
-		}
-	}
-	*p++ = '\'';
-	*p = '\0';
-
-	return escaped;
+	return shellQuoteAlloc(str);
 }
 
 // Execute curl and capture output
@@ -121,7 +90,9 @@ static HTTP_Response* execute_curl(const char* url, const char* post_data, const
 
 	// Build curl command
 	// -s: silent (no progress)
-	// -S: show errors
+	// stderr goes to /dev/null: mixed into stdout, an error line would end up
+	//   in the body (curl still prints the status after a partial transfer);
+	//   the exit code says what failed
 	// TLS: NX Redux ships a CA bundle (the firmware itself carries none), so
 	//   verify against it with --cacert when nx_ca_bundle_path() finds one.
 	//   Only when no bundle exists on the card do we fall back to -k (skip SSL
@@ -133,6 +104,7 @@ static HTTP_Response* execute_curl(const char* url, const char* post_data, const
 	// -m: max time
 	// -L: follow redirects
 	char cmd[4096];
+	int cmd_len = -1;
 	char user_agent[256];
 	HTTP_getUserAgent(user_agent, sizeof(user_agent));
 
@@ -180,36 +152,42 @@ static HTTP_Response* execute_curl(const char* url, const char* post_data, const
 			return response;
 		}
 
-		snprintf(cmd, sizeof(cmd),
-				 "curl -s -S %s -L --connect-timeout %d -m %d "
-				 "-A %s "
-				 "-H %s "
-				 "-d %s "
-				 "-w '\\n%%{http_code}' "
-				 "%s 2>&1",
-				 tls_opt,
-				 HTTP_TIMEOUT_SECS, HTTP_TIMEOUT_SECS * 2,
-				 escaped_ua,
-				 escaped_ct,
-				 escaped_data,
-				 escaped_url);
+		cmd_len = snprintf(cmd, sizeof(cmd),
+						   "curl -s %s -L --connect-timeout %d -m %d "
+						   "-A %s "
+						   "-H %s "
+						   "-d %s "
+						   "-w '\\n%%{http_code}' "
+						   "%s 2>/dev/null",
+						   tls_opt,
+						   HTTP_TIMEOUT_SECS, HTTP_TIMEOUT_SECS * 2,
+						   escaped_ua,
+						   escaped_ct,
+						   escaped_data,
+						   escaped_url);
 
 		free(escaped_data);
 		free(escaped_ct);
 	} else {
-		snprintf(cmd, sizeof(cmd),
-				 "curl -s -S %s -L --connect-timeout %d -m %d "
-				 "-A %s "
-				 "-w '\\n%%{http_code}' "
-				 "%s 2>&1",
-				 tls_opt,
-				 HTTP_TIMEOUT_SECS, HTTP_TIMEOUT_SECS * 2,
-				 escaped_ua,
-				 escaped_url);
+		cmd_len = snprintf(cmd, sizeof(cmd),
+						   "curl -s %s -L --connect-timeout %d -m %d "
+						   "-A %s "
+						   "-w '\\n%%{http_code}' "
+						   "%s 2>/dev/null",
+						   tls_opt,
+						   HTTP_TIMEOUT_SECS, HTTP_TIMEOUT_SECS * 2,
+						   escaped_ua,
+						   escaped_url);
 	}
 
 	free(escaped_url);
 	free(escaped_ua);
+
+	// a cut-off command would send a truncated body or URL
+	if (cmd_len < 0 || (size_t)cmd_len >= sizeof(cmd)) {
+		response->error = strdup("Request too large");
+		return response;
+	}
 
 	// Execute curl
 	FILE* pipe = popen(cmd, "r");
@@ -237,37 +215,18 @@ static HTTP_Response* execute_curl(const char* url, const char* post_data, const
 		}
 	}
 
-	int exit_code = pclose(pipe);
+	int status = pclose(pipe);
+	int exit_code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
 
-	// Parse HTTP status from end of output
 	// Output format: <body>\n<status_code>
-	if (buf.size > 0) {
-		// Find last newline
-		char* last_newline = NULL;
-		for (size_t i = buf.size; i > 0; i--) {
-			if (buf.data[i - 1] == '\n') {
-				last_newline = &buf.data[i - 1];
-				break;
-			}
-		}
+	response->http_status = HTTP_splitStatus(buf.data, &buf.size);
 
-		if (last_newline) {
-			// Parse status code after newline
-			int status = atoi(last_newline + 1);
-			if (status >= 100 && status < 600) {
-				response->http_status = status;
-				// Truncate buffer to remove status code
-				*last_newline = '\0';
-				buf.size = last_newline - buf.data;
-			}
-		}
-	}
-
-	// Check for curl errors
-	if (exit_code != 0 && response->http_status <= 0) {
-		// Curl failed - the output is likely an error message
-		response->error = buf.data;
-		buf.data = NULL;
+	// A transport failure (timeout, reset, TLS) fails the request even when
+	// a status arrived: the body is cut short
+	if (exit_code != 0) {
+		char msg[96];
+		snprintf(msg, sizeof(msg), "%s (curl %d)", HTTP_curlErrorText(exit_code), exit_code);
+		response->error = strdup(msg);
 		HTTPBuffer_free(&buf);
 		return response;
 	}
@@ -318,19 +277,68 @@ static int async_request_thread(void* data) {
 	return 0;
 }
 
+// A request that can't start is answered with an error response, right away
+// on the calling thread. That callback often starts the next queued request
+// (RA badges), which can fail the same way: delivered recursively, a long
+// queue would nest one stack frame per item. So failures raised while one is
+// being delivered are queued, and the outermost call drains them in a loop.
+typedef struct FailedRequest {
+	HTTP_Callback callback;
+	void* userdata;
+	const char* error;
+	struct FailedRequest* next;
+} FailedRequest;
+static __thread FailedRequest* failed_head = NULL;
+static __thread FailedRequest* failed_tail = NULL;
+static __thread int delivering_failures = 0;
+
+static void call_failed(HTTP_Callback callback, void* userdata, const char* error) {
+	HTTP_Response* response = calloc(1, sizeof(HTTP_Response));
+	if (response) {
+		response->http_status = -1;
+		response->error = strdup(error);
+	}
+	callback(response, userdata);
+}
+
+static void deliver_failure(HTTP_Callback callback, void* userdata, const char* error) {
+	if (!callback)
+		return;
+	FailedRequest* f = malloc(sizeof(*f));
+	if (!f) {
+		call_failed(callback, userdata, error);
+		return;
+	}
+	f->callback = callback;
+	f->userdata = userdata;
+	f->error = error;
+	f->next = NULL;
+	if (failed_tail)
+		failed_tail->next = f;
+	else
+		failed_head = f;
+	failed_tail = f;
+	if (delivering_failures)
+		return; // the loop below, further up this stack, delivers it
+
+	delivering_failures = 1;
+	while (failed_head) {
+		FailedRequest* next = failed_head;
+		failed_head = next->next;
+		if (!failed_head)
+			failed_tail = NULL;
+		call_failed(next->callback, next->userdata, next->error);
+		free(next);
+	}
+	delivering_failures = 0;
+}
+
 static void start_async_request(const char* url, const char* post_data,
 								const char* content_type, HTTP_Callback callback,
 								void* userdata) {
 	AsyncRequestData* req = calloc(1, sizeof(AsyncRequestData));
 	if (!req) {
-		// Callback with error
-		HTTP_Response* response = calloc(1, sizeof(HTTP_Response));
-		if (response) {
-			response->http_status = -1;
-			response->error = strdup("Memory allocation failed");
-		}
-		if (callback)
-			callback(response, userdata);
+		deliver_failure(callback, userdata, "Memory allocation failed");
 		return;
 	}
 
@@ -344,13 +352,7 @@ static void start_async_request(const char* url, const char* post_data,
 		free(req->post_data);
 		free(req->content_type);
 		free(req);
-		HTTP_Response* response = calloc(1, sizeof(HTTP_Response));
-		if (response) {
-			response->http_status = -1;
-			response->error = strdup("Memory allocation failed");
-		}
-		if (callback)
-			callback(response, userdata);
+		deliver_failure(callback, userdata, "Memory allocation failed");
 		return;
 	}
 
@@ -361,13 +363,7 @@ static void start_async_request(const char* url, const char* post_data,
 		free(req->post_data);
 		free(req->content_type);
 		free(req);
-		HTTP_Response* response = calloc(1, sizeof(HTTP_Response));
-		if (response) {
-			response->http_status = -1;
-			response->error = strdup("Failed to create thread");
-		}
-		if (callback)
-			callback(response, userdata);
+		deliver_failure(callback, userdata, "Failed to create thread");
 		return;
 	}
 
@@ -407,27 +403,11 @@ void HTTP_freeResponse(HTTP_Response* response) {
 char* HTTP_urlEncode(const char* str) {
 	if (!str)
 		return NULL;
-
-	// Count required size (worst case: every char becomes %XX)
-	size_t len = strlen(str);
-	char* encoded = malloc(len * 3 + 1);
-	if (!encoded)
-		return NULL;
-
-	char* p = encoded;
-	for (size_t i = 0; i < len; i++) {
-		unsigned char c = (unsigned char)str[i];
-		if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
-			*p++ = c;
-		} else if (c == ' ') {
-			*p++ = '+';
-		} else {
-			sprintf(p, "%%%02X", c);
-			p += 3;
-		}
-	}
-	*p = '\0';
-
+	// worst case every byte becomes %XX; urlEncode stops 4 bytes short of the end
+	size_t size = strlen(str) * 3 + 4;
+	char* encoded = malloc(size);
+	if (encoded)
+		urlEncode(str, encoded, size);
 	return encoded;
 }
 

@@ -5,6 +5,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+// One folder per console, the one minarch reads for every core of it (MGBA
+// reads GBA, SUPA reads SFC, PSX reads PS, GPGX reads MD/SMS/GG/SG1000/SEGACD).
+// Super Game Boy keeps its own copy of the Game Boy set.
 const CheatdbMap CHEATDB_MAP[] = {
 	{"FC", "Nintendo - Nintendo Entertainment System"},
 	{"FDS", "Nintendo - Family Computer Disk System"},
@@ -12,9 +15,7 @@ const CheatdbMap CHEATDB_MAP[] = {
 	{"SGB", "Nintendo - Game Boy"},
 	{"GBC", "Nintendo - Game Boy Color"},
 	{"GBA", "Nintendo - Game Boy Advance"},
-	{"MGBA", "Nintendo - Game Boy Advance"},
 	{"SFC", "Nintendo - Super Nintendo Entertainment System"},
-	{"SUPA", "Nintendo - Super Nintendo Entertainment System"},
 	{"VB", "Nintendo - Virtual Boy"},
 	{"N64", "Nintendo - Nintendo 64"},
 	{"NDS", "Nintendo - Nintendo DS"},
@@ -26,7 +27,6 @@ const CheatdbMap CHEATDB_MAP[] = {
 	{"SG1000", "Sega - SG-1000"},
 	{"DC", "Sega - Dreamcast"},
 	{"PS", "Sony - PlayStation"},
-	{"PSX", "Sony - PlayStation"},
 	{"PSP", "Sony - PlayStation Portable"},
 	{"PCE", "NEC - PC Engine - TurboGrafx 16"},
 	{"A2600", "Atari - 2600"},
@@ -173,9 +173,15 @@ void Cheatdb_removeAll(const CheatdbPaths* p) {
 		// Collect unique parent dirs to prune afterwards (bounded, 64 tags).
 		char dirs[64][512];
 		int ndirs = 0;
+		// A line longer than the buffer arrives in pieces: skip all of them,
+		// so a tail piece is never removed as a path of its own.
+		bool in_long_line = false;
 		while (fgets(line, sizeof(line), f)) {
+			bool whole = strchr(line, '\n') || feof(f);
+			bool skip = in_long_line || !whole;
+			in_long_line = !whole;
 			line[strcspn(line, "\r\n")] = '\0';
-			if (!line[0])
+			if (skip || !line[0])
 				continue;
 			remove(line);
 			char d[512];

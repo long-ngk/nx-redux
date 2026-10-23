@@ -29,6 +29,7 @@ static void sigHandler(int sig) {
 	case SIGINT:
 	case SIGTERM:
 		quit = true;
+		ModuleCommon_requestQuit(); // the module loops check it
 		// Terminate a running ffplay child too — the main loop is blocked
 		// waiting on it and it would otherwise be orphaned. Async-signal-safe.
 		FfplayEngine_signalStop();
@@ -137,7 +138,6 @@ int main(int argc, char* argv[]) {
 
 	IPTVModule_cleanup();
 	IPTV_curated_cleanup();
-	IPTV_cleanup();
 	ModuleCommon_quit();
 	Icons_quit();
 

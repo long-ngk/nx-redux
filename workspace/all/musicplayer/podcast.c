@@ -9,6 +9,7 @@
 #endif
 #include "podcast.h"
 #include "../common/wget_fetch.h"
+#include "../common/tz_country.h"
 #ifndef MUSIC_UI_BUILD
 #include "player.h"
 #endif
@@ -38,86 +39,6 @@
 // JSON library
 #include "../include/parson/parson.h"
 
-// Timezone to country code mapping for Apple Podcast charts
-typedef struct {
-	const char* timezone; // Timezone name or city
-	const char* country;  // ISO 3166-1 alpha-2 country code
-} TimezoneCountryMap;
-
-static const TimezoneCountryMap tz_country_map[] = {
-	// Asia
-	{"Kuala_Lumpur", "my"},
-	{"Singapore", "sg"},
-	{"Jakarta", "id"},
-	{"Bangkok", "th"},
-	{"Ho_Chi_Minh", "vn"},
-	{"Saigon", "vn"},
-	{"Manila", "ph"},
-	{"Tokyo", "jp"},
-	{"Seoul", "kr"},
-	{"Shanghai", "cn"},
-	{"Hong_Kong", "hk"},
-	{"Taipei", "tw"},
-	{"Kolkata", "in"},
-	{"Calcutta", "in"},
-	{"Mumbai", "in"},
-	{"Dubai", "ae"},
-	{"Riyadh", "sa"},
-	{"Jerusalem", "il"},
-	{"Tel_Aviv", "il"},
-	// Europe
-	{"London", "gb"},
-	{"Paris", "fr"},
-	{"Berlin", "de"},
-	{"Rome", "it"},
-	{"Madrid", "es"},
-	{"Amsterdam", "nl"},
-	{"Brussels", "be"},
-	{"Vienna", "at"},
-	{"Zurich", "ch"},
-	{"Stockholm", "se"},
-	{"Oslo", "no"},
-	{"Copenhagen", "dk"},
-	{"Helsinki", "fi"},
-	{"Warsaw", "pl"},
-	{"Prague", "cz"},
-	{"Budapest", "hu"},
-	{"Athens", "gr"},
-	{"Moscow", "ru"},
-	{"Dublin", "ie"},
-	{"Lisbon", "pt"},
-	// Americas
-	{"New_York", "us"},
-	{"Los_Angeles", "us"},
-	{"Chicago", "us"},
-	{"Denver", "us"},
-	{"Phoenix", "us"},
-	{"Anchorage", "us"},
-	{"Honolulu", "us"},
-	{"Toronto", "ca"},
-	{"Vancouver", "ca"},
-	{"Montreal", "ca"},
-	{"Mexico_City", "mx"},
-	{"Sao_Paulo", "br"},
-	{"Buenos_Aires", "ar"},
-	{"Lima", "pe"},
-	{"Bogota", "co"},
-	{"Santiago", "cl"},
-	// Oceania
-	{"Sydney", "au"},
-	{"Melbourne", "au"},
-	{"Brisbane", "au"},
-	{"Perth", "au"},
-	{"Adelaide", "au"},
-	{"Auckland", "nz"},
-	// Africa
-	{"Cairo", "eg"},
-	{"Johannesburg", "za"},
-	{"Lagos", "ng"},
-	{"Nairobi", "ke"},
-	{"Casablanca", "ma"},
-	{NULL, NULL}};
-
 // Apple Podcast supported countries (subset of most common ones)
 // Full list: https://rss.marketingtools.apple.com/
 static const char* apple_podcast_countries[] = {
@@ -141,27 +62,6 @@ static bool is_apple_podcast_country(const char* country) {
 		}
 	}
 	return false;
-}
-
-// Get country code from timezone path like /usr/share/zoneinfo/Asia/Kuala_Lumpur
-static const char* get_country_from_timezone(const char* tz_path) {
-	if (!tz_path)
-		return NULL;
-
-	// Find the last component (city name)
-	const char* city = strrchr(tz_path, '/');
-	if (city)
-		city++;
-	else
-		city = tz_path;
-
-	// Look up in mapping table
-	for (int i = 0; tz_country_map[i].timezone != NULL; i++) {
-		if (strcmp(city, tz_country_map[i].timezone) == 0) {
-			return tz_country_map[i].country;
-		}
-	}
-	return NULL;
 }
 
 // Paths
@@ -225,6 +125,8 @@ typedef struct {
 } ProgressEntry;
 static ProgressEntry progress_entries[MAX_PROGRESS_ENTRIES];
 static int progress_entry_count = 0;
+// progress_entries is re-read by the feed refresh thread while the UI reads it
+static pthread_mutex_t progress_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Episode cache - only load PODCAST_EPISODE_PAGE_SIZE episodes at a time
 static PodcastEpisode episode_cache[PODCAST_EPISODE_PAGE_SIZE];
@@ -232,6 +134,12 @@ static int episode_cache_feed_index = -1;
 static int episode_cache_offset = 0;
 static int episode_cache_count = 0;
 static pthread_mutex_t episode_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+// Parsed episodes.json of the feed being browsed, so paging through it does
+// not parse the whole file again for every page (guarded by
+// episode_cache_mutex; re-read when the file changes on disk)
+static JSON_Value* episodes_doc = NULL;
+static char episodes_doc_path[512];
+static struct stat episodes_doc_stat;
 
 // Continue Listening
 static ContinueListeningEntry continue_listening[PODCAST_MAX_CONTINUE_LISTENING];
@@ -426,6 +334,34 @@ int Podcast_saveEpisodes(int feed_index, PodcastEpisode* episodes, int count) {
 	return 0;
 }
 
+static void episodes_doc_free(void) {
+	if (episodes_doc)
+		json_value_free(episodes_doc);
+	episodes_doc = NULL;
+	episodes_doc_path[0] = '\0';
+}
+
+// The parsed episodes.json at path: the kept one while the file is unchanged.
+// Call with episode_cache_mutex held.
+static JSON_Value* episodes_doc_get(const char* path) {
+	struct stat st;
+	if (stat(path, &st) != 0) {
+		episodes_doc_free();
+		return NULL;
+	}
+	if (episodes_doc && strcmp(episodes_doc_path, path) == 0 && st.st_size == episodes_doc_stat.st_size &&
+		st.st_mtim.tv_sec == episodes_doc_stat.st_mtim.tv_sec &&
+		st.st_mtim.tv_nsec == episodes_doc_stat.st_mtim.tv_nsec && st.st_ino == episodes_doc_stat.st_ino)
+		return episodes_doc;
+	episodes_doc_free();
+	episodes_doc = json_parse_file(path);
+	if (episodes_doc) {
+		snprintf(episodes_doc_path, sizeof(episodes_doc_path), "%s", path);
+		episodes_doc_stat = st;
+	}
+	return episodes_doc;
+}
+
 // Load a page of episodes from JSON file into cache
 int Podcast_loadEpisodePage(int feed_index, int offset) {
 	if (feed_index < 0 || feed_index >= subscription_count || offset < 0) {
@@ -439,22 +375,22 @@ int Podcast_loadEpisodePage(int feed_index, int offset) {
 	char episodes_path[512];
 	get_episodes_file_path(feed->feed_id, episodes_path, sizeof(episodes_path));
 
-	JSON_Value* root = json_parse_file(episodes_path);
+	pthread_mutex_lock(&episode_cache_mutex);
+	JSON_Value* root = episodes_doc_get(episodes_path);
 	if (!root) {
+		pthread_mutex_unlock(&episode_cache_mutex);
 		LOG_error("[Podcast] Failed to load episodes from %s\n", episodes_path);
 		return 0;
 	}
 
 	JSON_Array* arr = json_value_get_array(root);
 	if (!arr) {
-		json_value_free(root);
+		pthread_mutex_unlock(&episode_cache_mutex);
 		return 0;
 	}
 
 	int total = json_array_get_count(arr);
 	feed->episode_count = total; // Update total count
-
-	pthread_mutex_lock(&episode_cache_mutex);
 
 	episode_cache_feed_index = feed_index;
 	episode_cache_offset = offset;
@@ -500,10 +436,10 @@ int Podcast_loadEpisodePage(int feed_index, int offset) {
 		episode_cache_count++;
 	}
 
+	int loaded = episode_cache_count;
 	pthread_mutex_unlock(&episode_cache_mutex);
-	json_value_free(root);
 
-	return episode_cache_count;
+	return loaded;
 }
 
 // Get episode by index (loads from cache, auto-loads page if needed).
@@ -564,15 +500,12 @@ void Podcast_invalidateEpisodeCache(void) {
 	episode_cache_feed_index = -1;
 	episode_cache_offset = 0;
 	episode_cache_count = 0;
+	episodes_doc_free();
 	pthread_mutex_unlock(&episode_cache_mutex);
 }
 
-// External RSS parser functions (in podcast_rss.c)
-extern int podcast_rss_parse(const char* xml_data, int xml_len, PodcastFeed* feed);
-
 // External search functions (in podcast_search.c)
 extern int podcast_search_itunes(const char* query, PodcastSearchResult* results, int max_results);
-extern int podcast_search_lookup(const char* itunes_id, char* feed_url, int feed_url_size);
 extern int podcast_search_lookup_full(const char* itunes_id, char* feed_url, int feed_url_size,
 									  char* artwork_url, int artwork_url_size);
 extern int podcast_charts_fetch(const char* country_code, PodcastChartItem* top, int* top_count,
@@ -654,10 +587,13 @@ static void download_feed_artwork(PodcastFeed* feed) {
 // ============================================================================
 
 static void load_progress_file(void) {
-	progress_entry_count = 0;
 	JSON_Value* root = json_parse_file(progress_file);
-	if (!root)
+	pthread_mutex_lock(&progress_mutex);
+	progress_entry_count = 0;
+	if (!root) {
+		pthread_mutex_unlock(&progress_mutex);
 		return;
+	}
 	JSON_Array* arr = json_value_get_array(root);
 	if (arr) {
 		int count = json_array_get_count(arr);
@@ -675,6 +611,7 @@ static void load_progress_file(void) {
 			progress_entry_count++;
 		}
 	}
+	pthread_mutex_unlock(&progress_mutex);
 	json_value_free(root);
 }
 
@@ -697,19 +634,13 @@ static int podcast_init_internal(bool enable_catalog_and_downloads) {
 		mkdir(download_dir, 493);
 	}
 
-	// Detect country code from system timezone
-	// /etc/localtime symlinks to /tmp/localtime which resolves to the actual timezone
-	char tz_path[256] = {0};
-	ssize_t len = readlink("/tmp/localtime", tz_path, sizeof(tz_path) - 1);
-	if (len > 0) {
-		tz_path[len] = '\0';
-		const char* country = get_country_from_timezone(tz_path);
-		if (country) {
-			strncpy(charts_country_code, country, sizeof(charts_country_code) - 1);
-			charts_country_code[sizeof(charts_country_code) - 1] = '\0';
-		}
+	// Detect country code from system timezone, else the LANG environment variable
+	char country[8];
+	if (TZ_currentCountryCode(country, sizeof(country)) && strlen(country) == 2) {
+		charts_country_code[0] = tolower((unsigned char)country[0]);
+		charts_country_code[1] = tolower((unsigned char)country[1]);
+		charts_country_code[2] = '\0';
 	} else {
-		// Fallback: try LANG environment variable
 		const char* lang = getenv("LANG");
 		if (lang && strlen(lang) >= 5 && lang[2] == '_') {
 			charts_country_code[0] = tolower(lang[3]);
@@ -813,34 +744,6 @@ void Podcast_cleanupCatalog(void) {
 	podcast_initialized = false;
 }
 
-void Podcast_cleanup(void) {
-	// Stop any running operations
-	Podcast_cleanupCatalog();
-	return;
-	Podcast_cancelSearch();
-	Podcast_stopDownloads();
-	Podcast_stop();
-
-	// Wait for refresh thread to finish
-	for (int i = 0; i < 20 && refresh_running; i++) {
-		usleep(100000);
-	}
-
-	// Save state
-	Podcast_saveSubscriptions();
-	Podcast_saveDownloadQueue();
-	save_continue_listening();
-
-	// Save progress
-	Podcast_flushProgress();
-
-	// Clear UI caches
-	Podcast_clearThumbnailCache();
-
-	// Allow full re-initialization on next entry (including auto-resume of downloads)
-	podcast_initialized = false;
-}
-
 const char* Podcast_getError(void) {
 	return error_message;
 }
@@ -877,6 +780,29 @@ PodcastFeed* Podcast_getSubscription(int index) {
 	return &subscriptions[index];
 }
 
+// Largest accepted feed. Big back catalogues run to several MB; one over this
+// is refused whole, never cut (a cut feed parses up to the cut and the older
+// episodes would vanish from the saved list).
+#define PODCAST_FEED_MAX_SIZE (16 * 1024 * 1024)
+
+// Fetches a whole feed into a new buffer (caller frees). Returns its length,
+// or -1 on a network error, -2 when over PODCAST_FEED_MAX_SIZE, -3 when the
+// body is cut off (no closing root tag).
+static int fetch_feed(const char* feed_url, uint8_t** out) {
+	int bytes = wget_fetch_alloc(feed_url, PODCAST_FEED_MAX_SIZE, out);
+	if (bytes == -2)
+		return -2;
+	if (bytes <= 0)
+		return -1;
+	if (!podcast_rss_is_complete((const char*)*out, bytes)) {
+		LOG_error("[Podcast] Feed cut off (%d bytes): %s\n", bytes, feed_url);
+		free(*out);
+		*out = NULL;
+		return -3;
+	}
+	return bytes;
+}
+
 int Podcast_subscribe(const char* feed_url) {
 	if (!feed_url || subscription_count >= PODCAST_MAX_SUBSCRIPTIONS) {
 		return -1;
@@ -888,17 +814,14 @@ int Podcast_subscribe(const char* feed_url) {
 	}
 
 	// Fetch the feed
-	uint8_t* buffer = (uint8_t*)malloc(5 * 1024 * 1024); // 5MB buffer for large RSS feeds
-	if (!buffer) {
-		snprintf(error_message, sizeof(error_message), "Out of memory");
-		return -1;
-	}
-
-	int bytes = wget_fetch(feed_url, buffer, 5 * 1024 * 1024);
+	uint8_t* buffer = NULL;
+	int bytes = fetch_feed(feed_url, &buffer);
 	if (bytes <= 0) {
 		LOG_error("[Podcast] Failed to fetch feed: %s\n", feed_url);
 		free(buffer);
-		snprintf(error_message, sizeof(error_message), "Failed to fetch feed");
+		snprintf(error_message, sizeof(error_message),
+				 bytes == -2 ? "Feed too large" : bytes == -3 ? "Feed download incomplete"
+															  : "Failed to fetch feed");
 		return -1;
 	}
 
@@ -1153,11 +1076,9 @@ int Podcast_refreshFeed(int index) {
 	snprintf(feed_url, sizeof(feed_url), "%s", subscriptions[index].feed_url);
 	pthread_mutex_unlock(&subscriptions_mutex);
 
-	uint8_t* buffer = (uint8_t*)malloc(5 * 1024 * 1024); // 5MB buffer for large RSS feeds
-	if (!buffer)
-		return -1;
-
-	int bytes = wget_fetch(feed_url, buffer, 5 * 1024 * 1024);
+	// A failed, oversized or cut-off fetch keeps the saved episode list as it is
+	uint8_t* buffer = NULL;
+	int bytes = fetch_feed(feed_url, &buffer);
 	if (bytes <= 0) {
 		free(buffer);
 		return -1;
@@ -1289,8 +1210,9 @@ void Podcast_saveSubscriptions(void) {
 		json_object_set_string(feed_obj, "artwork_url", feed->artwork_url);
 		json_object_set_number(feed_obj, "last_updated", feed->last_updated);
 		json_object_set_number(feed_obj, "episode_count", feed->episode_count);
-		// Note: episodes are stored separately in <feed_id>/episodes.json
-		// new_episode_count is computed dynamically from episodes.json
+		// Note: episodes are stored separately in <feed_id>/episodes.json;
+		// the count of new ones is kept here so loading needs no episodes.json
+		json_object_set_number(feed_obj, "new_episode_count", feed->new_episode_count);
 
 		json_array_append_value(arr, feed_val);
 	}
@@ -1348,6 +1270,10 @@ void Podcast_loadSubscriptions(void) {
 
 		feed->last_updated = (uint32_t)json_object_get_number(feed_obj, "last_updated");
 		feed->episode_count = (int)json_object_get_number(feed_obj, "episode_count");
+		// -1: saved before the count was kept here, counted from episodes.json below
+		feed->new_episode_count = json_object_has_value_of_type(feed_obj, "new_episode_count", JSONNumber)
+									  ? (int)json_object_get_number(feed_obj, "new_episode_count")
+									  : -1;
 
 		// Generate feed_id if not loaded (for backward compatibility)
 		set_feed_id(feed);
@@ -1358,9 +1284,12 @@ void Podcast_loadSubscriptions(void) {
 	}
 	pthread_mutex_unlock(&subscriptions_mutex);
 
-	// Compute new_episode_count dynamically from each feed's episodes.json
+	// Count new episodes from episodes.json for feeds saved without the count
+	// (the next save keeps it in subscriptions.json)
 	for (int i = 0; i < subscription_count; i++) {
 		PodcastFeed* feed = &subscriptions[i];
+		if (feed->new_episode_count >= 0)
+			continue;
 		feed->new_episode_count = 0;
 		char episodes_path[512];
 		get_episodes_file_path(feed->feed_id, episodes_path, sizeof(episodes_path));
@@ -1761,11 +1690,13 @@ void Podcast_saveProgress(const char* feed_url, const char* episode_guid, int po
 	if (!feed_url || !episode_guid)
 		return;
 
+	pthread_mutex_lock(&progress_mutex);
 	// Find existing entry or add new one
 	for (int i = 0; i < progress_entry_count; i++) {
 		if (strcmp(progress_entries[i].feed_url, feed_url) == 0 &&
 			strcmp(progress_entries[i].episode_guid, episode_guid) == 0) {
 			progress_entries[i].position_sec = position_sec;
+			pthread_mutex_unlock(&progress_mutex);
 			return;
 		}
 	}
@@ -1781,19 +1712,24 @@ void Podcast_saveProgress(const char* feed_url, const char* episode_guid, int po
 	strncpy(progress_entries[progress_entry_count].episode_guid, episode_guid, PODCAST_MAX_GUID - 1);
 	progress_entries[progress_entry_count].position_sec = position_sec;
 	progress_entry_count++;
+	pthread_mutex_unlock(&progress_mutex);
 }
 
 int Podcast_getProgress(const char* feed_url, const char* episode_guid) {
 	if (!feed_url || !episode_guid)
 		return 0;
 
+	int position = 0;
+	pthread_mutex_lock(&progress_mutex);
 	for (int i = 0; i < progress_entry_count; i++) {
 		if (strcmp(progress_entries[i].feed_url, feed_url) == 0 &&
 			strcmp(progress_entries[i].episode_guid, episode_guid) == 0) {
-			return progress_entries[i].position_sec;
+			position = progress_entries[i].position_sec;
+			break;
 		}
 	}
-	return 0;
+	pthread_mutex_unlock(&progress_mutex);
+	return position;
 }
 
 void Podcast_markAsPlayed(const char* feed_url, const char* episode_guid) {
@@ -1804,6 +1740,7 @@ void Podcast_markAsPlayed(const char* feed_url, const char* episode_guid) {
 void Podcast_flushProgress(void) {
 	JSON_Value* root = json_value_init_array();
 	JSON_Array* arr = json_value_get_array(root);
+	pthread_mutex_lock(&progress_mutex);
 	for (int i = 0; i < progress_entry_count; i++) {
 		JSON_Value* item = json_value_init_object();
 		JSON_Object* obj = json_value_get_object(item);
@@ -1812,6 +1749,7 @@ void Podcast_flushProgress(void) {
 		json_object_set_number(obj, "position", progress_entries[i].position_sec);
 		json_array_append_value(arr, item);
 	}
+	pthread_mutex_unlock(&progress_mutex);
 	json_serialize_atomic(root, progress_file);
 	json_value_free(root);
 }
@@ -2519,28 +2457,32 @@ void Podcast_clearNewFlag(int feed_index, int episode_index) {
 		feed->new_episode_count--;
 	}
 
-	// Update the on-disk episodes.json
+	// Update the on-disk episodes.json (through the kept parse of it)
 	set_feed_id(feed);
 	char episodes_path[512];
 	get_episodes_file_path(feed->feed_id, episodes_path, sizeof(episodes_path));
 
-	JSON_Value* root = json_parse_file(episodes_path);
-	if (root) {
-		JSON_Array* arr = json_value_get_array(root);
-		if (arr) {
-			int total = json_array_get_count(arr);
-			for (int i = 0; i < total; i++) {
-				JSON_Object* obj = json_array_get_object(arr, i);
-				const char* guid = json_object_get_string(obj, "guid");
-				if (guid && strcmp(guid, guid_copy) == 0) {
-					json_object_set_boolean(obj, "is_new", false);
-					break;
-				}
+	pthread_mutex_lock(&episode_cache_mutex);
+	JSON_Value* root = episodes_doc_get(episodes_path);
+	JSON_Array* arr = root ? json_value_get_array(root) : NULL;
+	if (arr) {
+		int total = json_array_get_count(arr);
+		for (int i = 0; i < total; i++) {
+			JSON_Object* obj = json_array_get_object(arr, i);
+			const char* guid = json_object_get_string(obj, "guid");
+			if (guid && strcmp(guid, guid_copy) == 0) {
+				json_object_set_boolean(obj, "is_new", false);
+				break;
 			}
-			json_serialize_atomic(root, episodes_path);
 		}
-		json_value_free(root);
+		// the kept parse now matches the file written
+		if (json_serialize_atomic(root, episodes_path) != JSONSuccess || stat(episodes_path, &episodes_doc_stat) != 0)
+			episodes_doc_free();
 	}
+	pthread_mutex_unlock(&episode_cache_mutex);
+
+	// the count of new episodes is kept in subscriptions.json
+	Podcast_saveSubscriptions();
 }
 
 // ============================================================================

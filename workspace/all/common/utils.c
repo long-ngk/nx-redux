@@ -11,6 +11,7 @@
 #include <dirent.h>
 #include <signal.h>
 #include <stdint.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/wait.h>
@@ -100,12 +101,14 @@ void wrapString(char* string, size_t max_len, size_t max_lines) {
 	truncateString(line, max_len);
 }
 // based on https://stackoverflow.com/a/31775567/145965
+// Replaces every `search` in line (a buffer of buf_size bytes) in place.
+// Returns the number of replacements, or -1 when the result does not fit; the
+// matches before the one that did not fit stay replaced.
 int replaceString(char* line, size_t buf_size, const char* search, const char* replace) {
 	char* sp; // start of pattern
-	if ((sp = strstr(line, search)) == NULL) {
+	if (!*search || (sp = strstr(line, search)) == NULL) {
 		return 0;
 	}
-	int count = 1;
 	size_t sLen = strlen(search);
 	size_t rLen = strlen(replace);
 	size_t tail_len = strlen(sp + sLen);
@@ -126,11 +129,77 @@ int replaceString(char* line, size_t buf_size, const char* search, const char* r
 		memmove(sp + rLen, sp + sLen, tail_len + 1);
 	}
 	memcpy(sp, replace, rLen);
-	count += replaceString(sp + rLen, buf_size, search, replace);
-	return count;
+	// The rest of the line only has the space left after this replacement.
+	char* rest = sp + rLen;
+	int more = replaceString(rest, buf_size - (size_t)(rest - line), search, replace);
+	return more < 0 ? -1 : 1 + more;
 }
+
+int shellEscapeQuotes(char* dst, size_t dst_size, const char* src) {
+	if (!dst || dst_size == 0)
+		return -1;
+	if (!src)
+		src = "";
+	size_t need = 0;
+	for (const char* c = src; *c; c++)
+		need += (*c == '\'') ? 4 : 1;
+	if (need + 1 > dst_size) {
+		dst[0] = '\0';
+		return -1;
+	}
+	char* p = dst;
+	for (const char* c = src; *c; c++) {
+		if (*c == '\'') {
+			// close quote, escaped quote, reopen quote
+			memcpy(p, "'\\''", 4);
+			p += 4;
+		} else {
+			*p++ = *c;
+		}
+	}
+	*p = '\0';
+	return (int)need;
+}
+
+char* shellQuoteAlloc(const char* src) {
+	if (!src)
+		src = "";
+	size_t size = 3; // two quotes + NUL
+	for (const char* c = src; *c; c++)
+		size += (*c == '\'') ? 4 : 1;
+	char* out = malloc(size);
+	if (!out)
+		return NULL;
+	out[0] = '\'';
+	shellEscapeQuotes(out + 1, size - 2, src);
+	out[size - 2] = '\'';
+	out[size - 1] = '\0';
+	return out;
+}
+
 char* escapeSingleQuotes(char* str, size_t buf_size) {
-	replaceString(str, buf_size, "'", "'\\''");
+	// All or nothing: a partly escaped string would leave the caller's
+	// single-quoted argument unbalanced, so on overflow it is emptied instead.
+	size_t len = strlen(str);
+	size_t need = len;
+	for (const char* c = str; *c; c++)
+		if (*c == '\'')
+			need += 3;
+	if (need + 1 > buf_size) {
+		str[0] = '\0';
+		return str;
+	}
+	// Expand in place from the end so no source byte is overwritten unread.
+	char* dst = str + need;
+	*dst = '\0';
+	for (size_t i = len; i-- > 0;) {
+		if (str[i] == '\'') {
+			dst -= 4;
+			memcpy(dst, "'\\''", 4);
+		} else {
+			*--dst = str[i];
+		}
+	}
 	return str;
 }
 
@@ -192,7 +261,8 @@ size_t trimString(char* out, size_t len, const char* str, bool first) {
 	bool is_string = false;
 
 	// Trim leading space
-	while (strchr("\r\n\t {},", (unsigned char)*str) != NULL)
+	// strchr() matches the set's own terminator, so stop at the NUL first
+	while (*str && strchr("\r\n\t {},", (unsigned char)*str) != NULL)
 		str++;
 
 	end = str + 1;
@@ -242,7 +312,8 @@ void removeParentheses(char* str_out, const char* str_in) {
 	bool inside = false;
 	char end_char;
 
-	for (int i = 0; i < len && i < STR_MAX; i++) {
+	// STR_MAX - 1: a name of STR_MAX+ chars with no brackets kept every byte and wrote the NUL past temp
+	for (int i = 0; i < len && i < STR_MAX - 1; i++) {
 		if (!inside && (str_in[i] == '(' || str_in[i] == '[')) {
 			end_char = str_in[i] == '(' ? ')' : ']';
 			inside = true;
@@ -300,7 +371,7 @@ char* removeExtension(const char* myStr) {
 	if (retStr == NULL)
 		return NULL;
 	strcpy(retStr, myStr);
-	if ((lastExt = strrchr(retStr, '.')) != NULL && *(lastExt + 1) != ' ' && *(lastExt + 2) != '\0')
+	if ((lastExt = strrchr(retStr, '.')) != NULL && lastExt[1] != '\0' && lastExt[1] != ' ' && lastExt[2] != '\0')
 		*lastExt = '\0';
 	return retStr;
 }
@@ -369,11 +440,14 @@ void cleanName(char* name_out, const char* file_name) {
 	free(no_underscores);
 }
 bool pathRelativeTo(char* path_out, const char* dir_from, const char* file_to) {
+	// path_out is MAX_PATH bytes. realpath() allocates: a resolved path can be up to
+	// PATH_MAX, far past MAX_PATH, so it never writes into a fixed buffer here.
 	path_out[0] = '\0';
 
-	char abs_from[MAX_PATH];
-	char abs_to[MAX_PATH];
-	if (realpath(dir_from, abs_from) == NULL || realpath(file_to, abs_to) == NULL) {
+	char* abs_from = realpath(dir_from, NULL);
+	char* abs_to = abs_from ? realpath(file_to, NULL) : NULL;
+	if (!abs_from || !abs_to) {
+		free(abs_from);
 		return false;
 	}
 
@@ -382,20 +456,53 @@ bool pathRelativeTo(char* path_out, const char* dir_from, const char* file_to) {
 	while (*p1 && (*p1 == *p2)) {
 		++p1, ++p2;
 	}
+	// The shared part ends on a whole path segment: "/a/bc" and "/a/bd/x" share "/a/", not "/a/b".
+	if (*p1 || (*p2 && *p2 != '/')) {
+		while (p1 > abs_from && p1[-1] != '/')
+			--p1, --p2;
+	}
 
 	if (*p2 == '/') {
 		++p2;
 	}
 
+	size_t used = 0;
+	bool ok = true;
 	if (strlen(p1) > 0) {
 		int num_parens = countChar(p1, '/') + 1;
-		for (int i = 0; i < num_parens; i++) {
-			strcat(path_out, "../");
+		for (int i = 0; ok && i < num_parens; i++) {
+			int n = snprintf(path_out + used, MAX_PATH - used, "../");
+			ok = n >= 0 && (size_t)n < MAX_PATH - used;
+			if (ok)
+				used += n;
 		}
 	}
-	strcat(path_out, p2);
+	if (ok) {
+		int n = snprintf(path_out + used, MAX_PATH - used, "%s", p2);
+		ok = n >= 0 && (size_t)n < MAX_PATH - used;
+	}
+	if (!ok)
+		path_out[0] = '\0'; // too long for MAX_PATH: report failure, never a cut path
 
-	return true;
+	free(abs_from);
+	free(abs_to);
+	return ok;
+}
+
+bool isFileExtension(const char* dot) {
+	// 2-4 letters or digits after the dot, at least one a letter (.p8, .7z, .doom). Anything
+	// else is part of the name: the ". 3" in "Super Mario Bros. 3", or the ".11" in "Game 1.11".
+	size_t len = strlen(dot);
+	if (dot[0] != '.' || len < 3 || len > 5)
+		return false;
+	bool letter = false;
+	for (const char* c = dot + 1; *c; c++) {
+		if (!isalnum((unsigned char)*c))
+			return false;
+		if (isalpha((unsigned char)*c))
+			letter = true;
+	}
+	return letter;
 }
 
 void getDisplayName(const char* in_name, char* out_name) { // NOTE: out_name needs to be MAX_PATH length!
@@ -410,13 +517,8 @@ void getDisplayName(const char* in_name, char* out_name) { // NOTE: out_name nee
 		strcpy(out_name, tmp + 1);
 
 	// remove extension(s), eg. .p8.png
-	while ((tmp = strrchr(out_name, '.')) != NULL) {
-		int len = strlen(tmp);
-		if (len > 2 && len <= 5)
-			tmp[0] = '\0'; // 1-4 letter extension plus dot (was 1-3, extended for .doom files)
-		else
-			break;
-	}
+	while ((tmp = strrchr(out_name, '.')) != NULL && isFileExtension(tmp))
+		tmp[0] = '\0';
 
 	// remove trailing parens (round and square)
 	strcpy(work_name, out_name);
@@ -510,17 +612,7 @@ void trimSortingMeta(char** str) { // eg. `001) `
 ///////////////////////////////////////
 
 void mkdir_p(const char* path) {
-	char tmp[MAX_PATH];
-	strncpy(tmp, path, sizeof(tmp) - 1);
-	tmp[sizeof(tmp) - 1] = '\0';
-	for (char* p = tmp + 1; *p; p++) {
-		if (*p == '/') {
-			*p = '\0';
-			mkdir(tmp, 0777);
-			*p = '/';
-		}
-	}
-	mkdir(tmp, 0777);
+	mkdir_p_mode(path, 0777);
 }
 
 bool exists(char* path) {
@@ -548,17 +640,21 @@ void putFile(char* path, char* contents) {
 int writeFileAtomic(const char* path, const char* data, size_t len) {
 	// stage to a sibling tmp then rename so a power cut or ENOSPC mid-write
 	// can never leave a truncated file at path; rename also refreshes the
-	// mtime that cache-staleness checks rely on
-	char tmp[MAX_PATH + 16];
-	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+	// mtime that cache-staleness checks rely on. Data is fsync'd before the
+	// rename; callers that must also persist the rename itself (a launch-time
+	// power cut) sync() afterwards.
+	char tmp[PATH_MAX + 8];
+	if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp))
+		return 0; // the temp name would be cut: never write a stray file
 	FILE* file = fopen(tmp, "wb");
 	if (!file)
 		return 0;
 	size_t wr = fwrite(data, 1, len, file);
-	fflush(file);
-	fsync(fileno(file));
-	fclose(file);
-	if (wr != len || rename(tmp, path) != 0) {
+	// a full card can surface only at flush or close; never rename a short file
+	int ok = wr == len && fflush(file) == 0 && fsync(fileno(file)) == 0;
+	if (fclose(file) != 0)
+		ok = 0;
+	if (!ok || rename(tmp, path) != 0) {
 		remove(tmp);
 		return 0;
 	}
@@ -582,24 +678,7 @@ void getFile(char* path, char* buffer, size_t buffer_size) {
 	}
 }
 char* allocFile(char* path) { // caller must free!
-	char* contents = NULL;
-	FILE* file = fopen(path, "r");
-	if (file) {
-		fseek(file, 0L, SEEK_END);
-		long size = ftell(file);
-		if (size < 0) { // unseekable file / ftell error — fail cleanly
-			fclose(file);
-			return NULL;
-		}
-		contents = calloc(size + 1, sizeof(char));
-		if (contents) {
-			fseek(file, 0L, SEEK_SET);
-			fread(contents, sizeof(char), size, file);
-			contents[size] = '\0';
-		}
-		fclose(file);
-	}
-	return contents;
+	return allocFileCapped(path, LONG_MAX, NULL);
 }
 bool SimpleMode_readPin(char pin_out[5]) {
 	char buf[16] = {0};
@@ -634,8 +713,8 @@ int getInt(char* path) {
 	return i;
 }
 void putInt(char* path, int value) {
-	char buffer[8];
-	sprintf(buffer, "%d", value);
+	char buffer[16]; // fits INT_MIN
+	snprintf(buffer, sizeof(buffer), "%d", value);
 	putFile(path, buffer);
 }
 
@@ -694,10 +773,6 @@ int clamp(int x, int lower, int upper) {
 	return min(upper, max(x, lower));
 }
 
-double clampd(double x, double lower, double upper) {
-	return min(upper, max(x, lower));
-}
-
 const char* json_extract_string(const char* json, const char* key, char* out, size_t out_size) {
 	if (!json || !key || !out || out_size == 0)
 		return NULL;
@@ -747,7 +822,8 @@ void ROM_mediaArtPath(const char* rom_path, char* out, size_t out_size) {
 	char* dot = strrchr(base, '.');
 	if (dot)
 		*dot = '\0';
-	snprintf(out, out_size, "%s/.media/%s.png", dir, base);
+	if (snprintf(out, out_size, "%s/.media/%s.png", dir, base) >= (int)out_size)
+		out[0] = '\0'; // too long: no path rather than a cut one
 }
 
 // ROM_mediaArtPath with the variant subfolder spliced in:
@@ -766,7 +842,8 @@ void ROM_mediaArtVariantPath(const char* rom_path, const char* variant,
 	if (!slash)
 		return; // no .media component to splice into
 	*slash = '\0';
-	snprintf(out, out_size, "%s/%s/%s", base_path, variant, slash + 1);
+	if (snprintf(out, out_size, "%s/%s/%s", base_path, variant, slash + 1) >= (int)out_size)
+		out[0] = '\0'; // too long: no path rather than a cut one that names another file
 }
 
 // Game art the companion app (NX Redux Mobile) fetched may be stored as a JPEG under the same name:
@@ -820,10 +897,10 @@ static bool folderGameArtPath(const char* rom_path, const char* variant, char* o
 	if (!name)
 		return false;
 	char game[MAX_PATH];
-	snprintf(game, sizeof(game), "%s/%s.m3u", dir, name + 1);
+	if (snprintf(game, sizeof(game), "%s/%s.m3u", dir, name + 1) >= (int)sizeof(game))
+		return false;
 	if (!exists(game)) {
-		snprintf(game, sizeof(game), "%s/%s.cue", dir, name + 1);
-		if (!exists(game))
+		if (snprintf(game, sizeof(game), "%s/%s.cue", dir, name + 1) >= (int)sizeof(game) || !exists(game))
 			return false;
 	}
 	char path[MAX_PATH];
@@ -964,8 +1041,8 @@ int M3U_forEachDisc(const char* m3u_path, M3U_DiscFn fn, void* ctx) {
 		if (strlen(line) == 0)
 			continue;
 		char disc_path[MAX_PATH];
-		snprintf(disc_path, sizeof(disc_path), "%s%s", base_path, line);
-		if (!exists(disc_path))
+		if (snprintf(disc_path, sizeof(disc_path), "%s%s", base_path, line) >= (int)sizeof(disc_path) ||
+			!exists(disc_path))
 			continue;
 		bool keep = fn(disc_path, count, ctx);
 		count++;

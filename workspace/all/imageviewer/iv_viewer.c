@@ -5,9 +5,11 @@
 
 #include "iv_viewer.h"
 #include "api.h"
+#include "iv_cache.h"
 #include "iv_defines.h"
 #include "iv_probe.h"
 #include "iv_rotate.h"
+#include "iv_view_math.h"
 #include "ui_buttonhintbar.h"
 #include "ui_draw.h"
 #include "ui_loadingoverlay.h"
@@ -55,102 +57,11 @@ static int vw_prefetch_step;
 static char vw_prefetch_next_path[512];
 static char vw_prefetch_prev_path[512];
 
-// --- Prefetch cache: 3-slot LRU, bounded by a total-pixel budget ------------
-
-#define IV_CACHE_SLOTS 3
-#define IV_CACHE_PIXEL_BUDGET (IV_MAX_PIXELS + 8 * 1000 * 1000)
-
-typedef struct {
-	char path[512];
-	SDL_Surface* surf;
-	int ow, oh;
-	uint32_t lru;
-	bool used;
-} IvCacheSlot;
-
-static IvCacheSlot vw_cache[IV_CACHE_SLOTS];
-
-static bool cache_contains(const char* path) {
-	for (int i = 0; i < IV_CACHE_SLOTS; i++)
-		if (vw_cache[i].used && strcmp(vw_cache[i].path, path) == 0)
-			return true;
-	return false;
-}
-
-// Removes and returns a hit; ownership of the surface moves to the caller.
-static bool cache_take(const char* path, SDL_Surface** out_surf, int* out_ow, int* out_oh) {
-	for (int i = 0; i < IV_CACHE_SLOTS; i++) {
-		if (vw_cache[i].used && strcmp(vw_cache[i].path, path) == 0) {
-			*out_surf = vw_cache[i].surf;
-			*out_ow = vw_cache[i].ow;
-			*out_oh = vw_cache[i].oh;
-			vw_cache[i].used = false;
-			vw_cache[i].surf = NULL;
-			return true;
-		}
-	}
-	return false;
-}
-
-static long cache_total_pixels(void) {
-	long total = 0;
-	for (int i = 0; i < IV_CACHE_SLOTS; i++)
-		if (vw_cache[i].used)
-			total += (long)vw_cache[i].ow * vw_cache[i].oh;
-	return total;
-}
-
-// Inserts with LRU eviction; frees `surf` instead of caching it if the pixel
-// budget can't be met even after evicting the least-recently-used entry.
-static void cache_put(const char* path, SDL_Surface* surf, int ow, int oh) {
-	for (int i = 0; i < IV_CACHE_SLOTS; i++) {
-		if (vw_cache[i].used && strcmp(vw_cache[i].path, path) == 0) {
-			SDL_FreeSurface(vw_cache[i].surf);
-			vw_cache[i].surf = surf;
-			vw_cache[i].ow = ow;
-			vw_cache[i].oh = oh;
-			vw_cache[i].lru = SDL_GetTicks();
-			return;
-		}
-	}
-
-	int slot = -1;
-	for (int i = 0; i < IV_CACHE_SLOTS; i++) {
-		if (!vw_cache[i].used) {
-			slot = i;
-			break;
-		}
-	}
-	if (slot < 0) {
-		slot = 0;
-		for (int i = 1; i < IV_CACHE_SLOTS; i++)
-			if (vw_cache[i].lru < vw_cache[slot].lru)
-				slot = i;
-		SDL_FreeSurface(vw_cache[slot].surf);
-		vw_cache[slot].used = false;
-	}
-
-	if (cache_total_pixels() + (long)ow * oh > IV_CACHE_PIXEL_BUDGET) {
-		SDL_FreeSurface(surf);
-		return;
-	}
-
-	vw_cache[slot].used = true;
-	snprintf(vw_cache[slot].path, sizeof(vw_cache[slot].path), "%s", path);
-	vw_cache[slot].surf = surf;
-	vw_cache[slot].ow = ow;
-	vw_cache[slot].oh = oh;
-	vw_cache[slot].lru = SDL_GetTicks();
-}
-
-static void cache_clear(void) {
-	for (int i = 0; i < IV_CACHE_SLOTS; i++) {
-		if (vw_cache[i].used) {
-			SDL_FreeSurface(vw_cache[i].surf);
-			vw_cache[i].surf = NULL;
-			vw_cache[i].used = false;
-		}
-	}
+// Frees the prefetched neighbors and stops the prefetch sequence (they are
+// decoded again from disk when navigated to).
+static void vw_drop_prefetch(void) {
+	IvCache_clear();
+	vw_prefetch_step = 2;
 }
 
 // --- Navigation --------------------------------------------------------
@@ -168,6 +79,10 @@ static bool vw_flush_rotation(void) {
 	if (vw_rot_pending == 0)
 		return true;
 	ImageEntry* e = &vw_browser->entries[vw_index];
+	// A PNG rotation decodes the file into two more full-size copies: make
+	// room by dropping the speculative neighbors first
+	if ((long)vw_ow * vw_oh > IV_ROTATE_KEEP_CACHE_PIXELS)
+		vw_drop_prefetch();
 	bool ok = IvRotate_file(e->path, vw_rot_pending);
 	vw_rot_pending = 0;
 	if (ok) {
@@ -184,6 +99,10 @@ static bool vw_flush_rotation(void) {
 
 // Turn the on-screen image a quarter clockwise and queue the file write.
 static void vw_rotate(void) {
+	// the turned copy briefly doubles a big image: drop the prefetched
+	// neighbors before allocating it
+	if ((long)vw_image->w * vw_image->h > IV_ROTATE_KEEP_CACHE_PIXELS)
+		vw_drop_prefetch();
 	SDL_Surface* r = IvRotate_surface(vw_image, 1);
 	if (!r)
 		return;
@@ -223,17 +142,16 @@ static void vw_prefetch_advance(void) {
 	while (vw_prefetch_step < 2) {
 		const char* target = vw_prefetch_step == 0 ? vw_prefetch_next_path : vw_prefetch_prev_path;
 		const char* current = vw_browser->entries[vw_index].path;
-		if (target[0] == '\0' || strcmp(target, current) == 0 || cache_contains(target)) {
+		if (target[0] == '\0' || strcmp(target, current) == 0 || IvCache_contains(target)) {
 			vw_prefetch_step++;
 			continue;
 		}
 		// OOM hardening: prefetching is speculative, so skip a neighbor the
 		// header probe confirms is oversized rather than decoding it on the
-		// chance it's never viewed (see IV_PREFETCH_MAX_PIXELS). A failed
-		// probe still prefetches - the loader's own IV_MAX_PIXELS backstop
-		// (post-decode, in decodeRequest) still applies either way.
+		// chance it's never viewed (see IV_PREFETCH_MAX_PIXELS). One whose
+		// size can't be probed is skipped too: it loads when viewed.
 		int probe_w = 0, probe_h = 0;
-		if (IvProbe_dimensions(target, &probe_w, &probe_h) &&
+		if (!IvProbe_dimensions(target, &probe_w, &probe_h) ||
 			(long)probe_w * probe_h > IV_PREFETCH_MAX_PIXELS) {
 			vw_prefetch_step++;
 			continue;
@@ -277,7 +195,7 @@ static void vw_load_index(int index) {
 	const char* path = vw_browser->entries[index].path;
 	SDL_Surface* hit;
 	int ow, oh;
-	if (cache_take(path, &hit, &ow, &oh)) {
+	if (IvCache_take(path, &hit, &ow, &oh)) {
 		vw_loading = false;
 		vw_apply_image(hit, ow, oh);
 	} else {
@@ -303,18 +221,8 @@ static void vw_nav(int dir) {
 // only): centered on vw_cx/vw_cy, sized to the visible image area, kept
 // inside the image bounds. Shared by input-time pan clamping and render.
 static SDL_Rect vw_src_rect(SDL_Surface* screen, float scale) {
-	int vis_w = (int)(screen->w / scale), vis_h = (int)(screen->h / scale);
-	SDL_Rect src = {vw_cx - vis_w / 2, vw_cy - vis_h / 2,
-					vis_w > vw_image->w ? vw_image->w : vis_w,
-					vis_h > vw_image->h ? vw_image->h : vis_h};
-	if (src.x < 0)
-		src.x = 0;
-	if (src.y < 0)
-		src.y = 0;
-	if (src.x + src.w > vw_image->w)
-		src.x = vw_image->w - src.w;
-	if (src.y + src.h > vw_image->h)
-		src.y = vw_image->h - src.h;
+	IvRect r = IvView_srcRect(screen->w, screen->h, scale, vw_image->w, vw_image->h, vw_cx, vw_cy);
+	SDL_Rect src = {r.x, r.y, r.w, r.h};
 	return src;
 }
 
@@ -322,23 +230,6 @@ static void vw_clamp_pan(SDL_Surface* screen, float scale) {
 	SDL_Rect src = vw_src_rect(screen, scale);
 	vw_cx = src.x + src.w / 2;
 	vw_cy = src.y + src.h / 2;
-}
-
-// Keeps `message`'s GPU toast layer in sync with its lifetime: forces a
-// redraw every frame it's visible, then once more on the expiry edge
-// (clearing the message) so the next render call actually wipes the layer -
-// otherwise UI_renderToast only re-clears when called again, and nothing
-// would call it once the viewer goes idle. Mirrors ModuleCommon_tickToast in
-// workspace/all/mediaplayer/module_common.c.
-static void tick_toast(char* message, uint32_t toast_time, bool* dirty) {
-	if (message[0] == '\0')
-		return;
-	if (SDL_GetTicks() - toast_time < TOAST_DURATION) {
-		*dirty = true;
-	} else {
-		message[0] = '\0';
-		*dirty = true;
-	}
 }
 
 // --- Public API ----------------------------------------------------------
@@ -368,7 +259,7 @@ IvViewerStatus IvViewer_update(SDL_Surface* screen, bool* dirty) {
 	while (IvLoader_poll(&res)) {
 		if (res.purpose == IV_LOAD_PREFETCH) {
 			if (res.status == IV_LOAD_OK && res.surface)
-				cache_put(res.path, res.surface, res.orig_w, res.orig_h);
+				IvCache_put(res.path, res.surface, res.orig_w, res.orig_h);
 			else if (res.surface)
 				SDL_FreeSurface(res.surface);
 			if (vw_prefetch_step < 2) {
@@ -410,7 +301,7 @@ IvViewerStatus IvViewer_update(SDL_Surface* screen, bool* dirty) {
 	// Toast tick, same idiom as the browser's: keeps redrawing while
 	// vw_toast is visible, then once more on the expiry edge so the final
 	// render call wipes the GPU layer.
-	tick_toast(vw_toast, vw_toast_time, dirty);
+	UI_tickToast(vw_toast, vw_toast_time, dirty);
 
 	// Hint-bar expiry edge: IvViewer_busy() below stops treating the viewer
 	// as busy the instant SDL_GetTicks() passes vw_hint_until, so without
@@ -615,7 +506,7 @@ void IvViewer_render(SDL_Surface* screen) {
 	}
 	// Unconditional: UI_renderToast clears its GPU layer itself when the
 	// message is empty or expired, which is what actually makes the toast
-	// disappear once tick_toast() clears the message on the expiry edge.
+	// disappear once UI_tickToast() clears the message on the expiry edge.
 	UI_renderToast(screen, vw_toast, vw_toast_time);
 }
 
@@ -640,7 +531,7 @@ void IvViewer_close(void) {
 		SDL_FreeSurface(vw_image);
 		vw_image = NULL;
 	}
-	cache_clear();
+	IvCache_clear();
 	vw_browser = NULL;
 	vw_toast[0] = '\0';
 	vw_prefetch_step = 2;

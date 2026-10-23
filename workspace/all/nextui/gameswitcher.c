@@ -2,6 +2,7 @@
 #include "api.h"
 #include "config.h"
 #include "defines.h"
+#include "entry_names.h"
 #include "gamelist.h"
 #include "imgloader.h"
 #include "gameinfo.h"
@@ -18,6 +19,7 @@
 #include "ui_emptystate.h"
 #include "ui_image.h"
 #include "ui_menubar.h"
+#include "image_probe.h"
 #include "ui_message.h"
 #include "ui_draw.h"
 #include "ui_fade.h"
@@ -94,43 +96,13 @@ static void gs_listBuild(void) {
 		if (!entry && recent) {
 			char sd_path[MAX_PATH];
 			snprintf(sd_path, sizeof(sd_path), "%s%s", SDCARD_PATH, recent->path);
-			entry = Entry_new(sd_path, ENTRY_ROM);
-			if (entry && recent->alias) {
-				free(entry->name);
-				entry->name = strdup(recent->alias);
-			}
+			entry = recent->alias ? Entry_newNamed(sd_path, ENTRY_ROM, recent->alias) : Entry_new(sd_path, ENTRY_ROM);
 		}
-		if (entry)
-			Array_push(gs_entries, entry);
+		EntryArray_push(gs_entries, entry);
 	}
 	// Games of one name from different consoles (Tetris on NES and Game Boy) read as a game list's do: the name, then
 	// its core's tag dimmed after it ("Tetris (GB)"); two of one name and tag, the file's name instead
-	for (int i = 0; i < gs_entries->count; i++) {
-		Entry* e = gs_entries->items[i];
-		bool dup = false, same_tag = false;
-		char tag[MAX_PATH];
-		getEmuName(e->path, tag);
-		for (int j = 0; j < gs_entries->count; j++) {
-			Entry* o = gs_entries->items[j];
-			if (j == i || !exactMatch(e->name, o->name))
-				continue;
-			dup = true;
-			char other[MAX_PATH];
-			getEmuName(o->path, other);
-			if (exactMatch(tag, other))
-				same_tag = true;
-		}
-		if (!dup)
-			continue;
-		char label[MAX_PATH], buf[MAX_PATH * 2 + 4];
-		if (same_tag)
-			snprintf(label, sizeof(label), "%s", baseName(e->path));
-		else
-			snprintf(label, sizeof(label), "%s", tag);
-		snprintf(buf, sizeof(buf), "%s (%s)", e->name, label);
-		free(e->unique);
-		e->unique = strdup(buf);
-	}
+	EntryNames_labelSwitcher(gs_entries);
 	gs_dir.path = (char*)"Recent";
 	gs_dir.name = (char*)"Recent";
 	gs_dir.entries = gs_entries;
@@ -227,7 +199,8 @@ static SDL_Surface* gs_get_cached_image(const char* path) {
 		SDL_FreeSurface(gs_img_surf);
 		gs_img_surf = NULL;
 	}
-	SDL_Surface* raw = IMG_Load(path);
+	// a huge picture is not decoded (cached as a miss like a missing file)
+	SDL_Surface* raw = ImageProbe_isOversized(path, IMAGE_PROBE_MAX_SIDE) ? NULL : IMG_Load(path);
 	if (raw)
 		raw = UI_convertSurface(raw, screen);
 	gs_img_surf = raw;
@@ -367,7 +340,7 @@ static void drawHeader(const char* rom_path, int status_w) {
 	if (tf) {
 		int max_w = screen->w - status_w - SCALE1(PADDING * 2) - x;
 		if (max_w > 0) {
-			GFX_truncateText(tf, selectedName(), cut, max_w, 0);
+			GFX_truncateText(tf, selectedName(), cut, sizeof(cut), max_w, 0);
 			SDL_Surface* text = GFX_getCachedText(tf, cut, COLOR_WHITE);
 			if (text)
 				SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){x, (BAR_HEIGHT - text->h) / 2});
@@ -380,7 +353,7 @@ static void drawHeader(const char* rom_path, int status_w) {
 	consoleName(rom_path, console, sizeof(console));
 	char line[MAX_PATH + 32];
 	snprintf(line, sizeof(line), "%s   %d / %d", console, switcher_selected + 1, gs_count);
-	GFX_truncateText(sf, line, cut, screen->w - x - SCALE1(PADDING), 0); // under the title's first letter
+	GFX_truncateText(sf, line, cut, sizeof(cut), screen->w - x - SCALE1(PADDING), 0); // under the title's first letter
 	SDL_Surface* text = GFX_getCachedText(sf, cut, COLOR_GRAY);
 	if (text)
 		SDL_BlitSurface(text, NULL, screen, &(SDL_Rect){x, BAR_HEIGHT});

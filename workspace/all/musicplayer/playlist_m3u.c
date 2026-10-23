@@ -142,14 +142,18 @@ int M3U_addTracks(const char* m3u_path, const PlaylistTrack* tracks, int count) 
 	if (!m3u_path || !tracks || count <= 0)
 		return -1;
 
-	// Read the existing paths once for the dup check.
-	PlaylistTrack existing[PLAYLIST_MAX_TRACKS];
+	// Read the existing paths once for the dup check (heap: ~386 KB).
+	PlaylistTrack* existing = malloc(sizeof(PlaylistTrack) * PLAYLIST_MAX_TRACKS);
+	if (!existing)
+		return -1;
 	int existing_count = 0;
 	M3U_loadTracks(m3u_path, existing, PLAYLIST_MAX_TRACKS, &existing_count);
 
 	FILE* f = fopen(m3u_path, "a");
-	if (!f)
+	if (!f) {
+		free(existing);
 		return -1;
+	}
 
 	int added = 0;
 	for (int i = 0; i < count; i++) {
@@ -178,6 +182,7 @@ int M3U_addTracks(const char* m3u_path, const PlaylistTrack* tracks, int count) 
 		}
 	}
 	fclose(f);
+	free(existing);
 	return added;
 }
 
@@ -227,7 +232,10 @@ int M3U_removeTrack(const char* m3u_path, int index) {
 	}
 	fclose(f);
 
-	// Find the track line at the given index (skip # and empty lines)
+	// Find the track line at the given index (skip # and empty lines). The
+	// index is one into M3U_loadTracks' list, which leaves out tracks whose
+	// file is missing: skip those here too, or a missing track before it
+	// shifts the count and the wrong track is removed.
 	int track_idx = 0;
 	int remove_line = -1;
 	for (int i = 0; i < line_count; i++) {
@@ -236,6 +244,10 @@ int M3U_removeTrack(const char* m3u_path, int index) {
 		while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
 			len--;
 		if (len == 0 || line[0] == '#')
+			continue;
+		char path[sizeof(buf)];
+		snprintf(path, sizeof(path), "%.*s", len, line);
+		if (access(path, F_OK) != 0)
 			continue;
 
 		if (track_idx == index) {

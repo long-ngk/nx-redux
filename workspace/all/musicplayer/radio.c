@@ -3,6 +3,7 @@
 #include "radio_net.h"
 #include "album_art.h"
 #include "radio_hls.h"
+#include "http_location.h"
 #include "tag_meta.h"
 #include "radio_catalog.h"
 #include "player.h"
@@ -325,75 +326,24 @@ static void radio_push_samples(const int16_t* samples, int total_samples, int ch
 	}
 }
 
-// Initialize SSL/TLS
+// Initialize SSL/TLS (a failed HTTPS connect still falls back to plain HTTP
+// in direct_connect)
 static int ssl_init(const char* host) {
-	int ret;
-	const char* pers = "radio_client";
-
-	mbedtls_net_init(&radio.ssl_net);
-	mbedtls_ssl_init(&radio.ssl);
-	mbedtls_ssl_config_init(&radio.ssl_conf);
-	mbedtls_entropy_init(&radio.entropy);
-	mbedtls_ctr_drbg_init(&radio.ctr_drbg);
-
-	// Seed random number generator
-	ret = mbedtls_ctr_drbg_seed(&radio.ctr_drbg, mbedtls_entropy_func,
-								&radio.entropy, (const unsigned char*)pers, strlen(pers));
-	if (ret != 0) {
-		LOG_error("mbedtls_ctr_drbg_seed failed: %d\n", ret);
-		goto ssl_init_error;
+	if (radio_net_tls_setup(&radio.ssl_net, &radio.ssl, &radio.ssl_conf, &radio.entropy,
+							&radio.ctr_drbg, "radio_client", host) != 0) {
+		radio_net_tls_free(&radio.ssl_net, &radio.ssl, &radio.ssl_conf, &radio.entropy,
+						   &radio.ctr_drbg, false);
+		return -1;
 	}
-
-	// Set up SSL config
-	ret = mbedtls_ssl_config_defaults(&radio.ssl_conf,
-									  MBEDTLS_SSL_IS_CLIENT,
-									  MBEDTLS_SSL_TRANSPORT_STREAM,
-									  MBEDTLS_SSL_PRESET_DEFAULT);
-	if (ret != 0) {
-		LOG_error("mbedtls_ssl_config_defaults failed: %d\n", ret);
-		goto ssl_init_error;
-	}
-
-	// Skip certificate verification (radio streams use various CAs)
-	mbedtls_ssl_conf_authmode(&radio.ssl_conf, MBEDTLS_SSL_VERIFY_NONE);
-	mbedtls_ssl_conf_rng(&radio.ssl_conf, mbedtls_ctr_drbg_random, &radio.ctr_drbg);
-
-	// Set up SSL context
-	ret = mbedtls_ssl_setup(&radio.ssl, &radio.ssl_conf);
-	if (ret != 0) {
-		LOG_error("mbedtls_ssl_setup failed: %d\n", ret);
-		goto ssl_init_error;
-	}
-
-	// Set hostname for SNI
-	ret = mbedtls_ssl_set_hostname(&radio.ssl, host);
-	if (ret != 0) {
-		LOG_error("mbedtls_ssl_set_hostname failed: %d\n", ret);
-		goto ssl_init_error;
-	}
-
 	radio.ssl_initialized = true;
 	return 0;
-
-ssl_init_error:
-	// Clean up all initialized contexts on error
-	mbedtls_net_free(&radio.ssl_net);
-	mbedtls_ssl_free(&radio.ssl);
-	mbedtls_ssl_config_free(&radio.ssl_conf);
-	mbedtls_ctr_drbg_free(&radio.ctr_drbg);
-	mbedtls_entropy_free(&radio.entropy);
-	return -1;
 }
 
 // Cleanup SSL
 static void ssl_cleanup(void) {
 	if (radio.ssl_initialized) {
-		mbedtls_ssl_close_notify(&radio.ssl);
-		mbedtls_net_free(&radio.ssl_net);
-		mbedtls_ssl_free(&radio.ssl);
-		mbedtls_ssl_config_free(&radio.ssl_conf);
-		mbedtls_ctr_drbg_free(&radio.ctr_drbg);
-		mbedtls_entropy_free(&radio.entropy);
+		radio_net_tls_free(&radio.ssl_net, &radio.ssl, &radio.ssl_conf, &radio.entropy,
+						   &radio.ctr_drbg, true);
 		radio.ssl_initialized = false;
 	}
 }
@@ -861,6 +811,8 @@ static void* hls_stream_thread_func(void* arg) {
 		snprintf(radio.error_msg, sizeof(radio.error_msg), "AAC decoder init failed");
 		return NULL;
 	}
+	// decode_buf holds 2048 stereo frames: mix multichannel streams to stereo
+	aacDecoder_SetParam(radio.aac_decoder, AAC_PCM_MAX_OUTPUT_CHANNELS, 2);
 	radio.aac_initialized = true;
 	radio.aac_inbuf_size = 0;
 	radio.aac_sample_rate = 0; // Will be set on first frame
@@ -871,43 +823,40 @@ static void* hls_stream_thread_func(void* arg) {
 	while (!radio.should_stop) {
 		loop_iteration++;
 
-		// Check if we need to refresh the playlist (for live streams)
-		if (radio.hls.is_live && radio.hls.current_segment >= radio.hls.segment_count) {
+		// Check if we need to refresh the playlist (live streams, or a finished
+		// playlist longer than the segments kept at once)
+		if ((radio.hls.is_live || radio.hls.has_more) && radio.hls.current_segment >= radio.hls.segment_count) {
 			// Fetch updated playlist
-			uint8_t* playlist_buf = malloc(64 * 1024);
-			if (playlist_buf) {
-				int len = radio_net_fetch(radio.current_url, playlist_buf, 64 * 1024, NULL, 0);
-				if (len > 0) {
-					playlist_buf[len] = '\0';
-					char base_url[HLS_MAX_URL_LEN];
-					radio_hls_get_base_url(radio.current_url, base_url, HLS_MAX_URL_LEN);
+			char* playlist = radio_hls_fetch_playlist(radio.current_url);
+			if (playlist) {
+				char base_url[HLS_MAX_URL_LEN];
+				radio_hls_get_base_url(radio.current_url, base_url, HLS_MAX_URL_LEN);
 
-					// Rewrite segments[] under the lock (the prefetch thread reads
-					// it), bump the epoch so any in-flight prefetch is discarded,
-					// and drop the current prefetch (its index is now stale).
-					pthread_mutex_lock(&radio.hls_mutex);
-					radio_hls_parse_playlist(&radio.hls, (char*)playlist_buf, base_url);
-					radio.hls_epoch++;
-					radio.hls_prefetch_ready = false;
-					radio.hls_prefetch_segment = -1;
+				// Rewrite segments[] under the lock (the prefetch thread reads
+				// it), bump the epoch so any in-flight prefetch is discarded,
+				// and drop the current prefetch (its index is now stale).
+				pthread_mutex_lock(&radio.hls_mutex);
+				radio_hls_parse_playlist(&radio.hls, playlist, base_url);
+				radio.hls_epoch++;
+				radio.hls_prefetch_ready = false;
+				radio.hls_prefetch_segment = -1;
 
-					// Skip segments we've already played based on last_played_sequence
-					// media_sequence is the sequence number of the first segment in the new playlist
-					// We want to start at last_played_sequence + 1
-					if (radio.hls.last_played_sequence >= 0) {
-						int next_seq = radio.hls.last_played_sequence + 1;
-						int start_idx = next_seq - radio.hls.media_sequence;
-						if (start_idx < 0)
-							start_idx = 0;
-						if (start_idx > radio.hls.segment_count)
-							start_idx = radio.hls.segment_count;
-						radio.hls.current_segment = start_idx;
-					} else {
-						radio.hls.current_segment = 0;
-					}
-					pthread_mutex_unlock(&radio.hls_mutex);
+				// Skip segments we've already played based on last_played_sequence
+				// media_sequence is the sequence number of the first segment in the new playlist
+				// We want to start at last_played_sequence + 1
+				if (radio.hls.last_played_sequence >= 0) {
+					int next_seq = radio.hls.last_played_sequence + 1;
+					int start_idx = next_seq - radio.hls.media_sequence;
+					if (start_idx < 0)
+						start_idx = 0;
+					if (start_idx > radio.hls.segment_count)
+						start_idx = radio.hls.segment_count;
+					radio.hls.current_segment = start_idx;
+				} else {
+					radio.hls.current_segment = radio_hls_live_start_index(&radio.hls);
 				}
-				free(playlist_buf);
+				pthread_mutex_unlock(&radio.hls_mutex);
+				free(playlist);
 			}
 
 			// If still no segments, wait a bit
@@ -1291,6 +1240,8 @@ static void* stream_thread_func(void* arg) {
 				// Initialize FDK-AAC decoder (TT_MP4_ADTS for ADTS-framed AAC streams)
 				radio.aac_decoder = aacDecoder_Open(TT_MP4_ADTS, 1);
 				if (radio.aac_decoder) {
+					// decode_buf holds 2048 stereo frames: mix multichannel to stereo
+					aacDecoder_SetParam(radio.aac_decoder, AAC_PCM_MAX_OUTPUT_CHANNELS, 2);
 					radio.aac_initialized = true;
 					radio.aac_inbuf_size = 0;
 					radio.aac_sample_rate = 0; // Will be set on first frame
@@ -1694,21 +1645,11 @@ void Radio_loadStations(void) {
 // Fetch + parse the HLS playlist for radio.current_url (network I/O; runs on
 // the stream thread). Returns 0 with segments ready, -1 on error (error_msg set).
 static int hls_connect(void) {
-	uint8_t* playlist_buf = malloc(64 * 1024);
-	if (!playlist_buf) {
-		snprintf(radio.error_msg, sizeof(radio.error_msg), "Memory allocation failed");
-		return -1;
-	}
-
-	int len = radio_net_fetch(radio.current_url, playlist_buf, 64 * 1024, NULL, 0);
-	if (len <= 0) {
-		free(playlist_buf);
+	char* playlist = radio_hls_fetch_playlist(radio.current_url);
+	if (!playlist) {
 		snprintf(radio.error_msg, sizeof(radio.error_msg), "Failed to fetch playlist");
 		return -1;
 	}
-	if (len >= 64 * 1024 - 1)
-		LOG_error("Warning: M3U8 playlist may be truncated (>64KB)\n");
-	playlist_buf[len] = '\0';
 
 	char base_url[HLS_MAX_URL_LEN];
 	radio_hls_get_base_url(radio.current_url, base_url, HLS_MAX_URL_LEN);
@@ -1717,8 +1658,9 @@ static int hls_connect(void) {
 	radio.hls.current_segment = 0;
 	radio.hls.last_played_sequence = -1;
 
-	int seg_count = radio_hls_parse_playlist(&radio.hls, (char*)playlist_buf, base_url);
-	free(playlist_buf);
+	int seg_count = radio_hls_parse_playlist(&radio.hls, playlist, base_url);
+	free(playlist);
+	radio.hls.current_segment = radio_hls_live_start_index(&radio.hls);
 
 	if (radio.hls.encrypted) {
 		snprintf(radio.error_msg, sizeof(radio.error_msg), "Encrypted stream not supported");
@@ -1801,8 +1743,10 @@ connect_attempt:
 				snprintf(radio.error_msg, sizeof(radio.error_msg), "Empty redirect URL");
 				return -1;
 			}
-			strncpy(current_url, radio.redirect_url, RADIO_MAX_URL - 1);
-			current_url[RADIO_MAX_URL - 1] = '\0';
+			// a relative Location is resolved against the URL just requested
+			char next_url[RADIO_MAX_URL];
+			HttpLocation_resolve(current_url, radio.redirect_url, next_url, sizeof(next_url));
+			snprintf(current_url, RADIO_MAX_URL, "%s", next_url);
 
 			if (redirect_count == max_redirects) {
 				snprintf(radio.error_msg, sizeof(radio.error_msg), "Too many redirects");
@@ -2135,10 +2079,6 @@ const CuratedCountry* Radio_getCuratedCountries(void) {
 	return RadioCatalog_getCountries();
 }
 
-int Radio_getCuratedStationCount(const char* country_code) {
-	return RadioCatalog_getStationCount(country_code);
-}
-
 const CuratedStation* Radio_getCuratedStations(const char* country_code, int* count) {
 	return RadioCatalog_getStations(country_code, count);
 }
@@ -2168,10 +2108,6 @@ bool Radio_removeStationByUrl(const char* url) {
 		}
 	}
 	return false;
-}
-
-SDL_Surface* Radio_getAlbumArt(void) {
-	return album_art_get();
 }
 
 SDL_Surface* Radio_getArtwork(const RadioMetadata* metadata, unsigned int* revision) {

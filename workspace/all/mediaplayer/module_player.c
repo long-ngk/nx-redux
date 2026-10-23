@@ -36,11 +36,9 @@ static void load_video_directory(VideoBrowserContext* browser, const char* path)
 static SDL_Surface* play_video_file(SDL_Surface* screen, VideoFileEntry* entry, int start_sec) {
 	FfplayConfig config;
 	memset(&config, 0, sizeof(config));
-	config.source = FFPLAY_SOURCE_LOCAL;
 	config.is_stream = false;
 	config.start_position_sec = start_sec;
 	config.screen_width = screen->w;
-	config.is_hevc = VideoBrowser_isHEVC(entry->path);
 	strncpy(config.path, entry->path, sizeof(config.path) - 1);
 	config.path[sizeof(config.path) - 1] = '\0';
 	VideoBrowser_getDisplayName(entry->name, config.title, sizeof(config.title));
@@ -59,14 +57,12 @@ static SDL_Surface* play_video_file(SDL_Surface* screen, VideoFileEntry* entry, 
 		for (int si = 0; si < sub_list.count; si++) {
 			strncpy(config.subtitle_paths[si], sub_list.entries[si].path, sizeof(config.subtitle_paths[0]) - 1);
 			config.subtitle_paths[si][sizeof(config.subtitle_paths[0]) - 1] = '\0';
-			strncpy(config.subtitle_labels[si], sub_list.entries[si].label, sizeof(config.subtitle_labels[0]) - 1);
-			config.subtitle_labels[si][sizeof(config.subtitle_labels[0]) - 1] = '\0';
 		}
 		// Also set legacy fields to the first subtitle for compatibility
 		strncpy(config.subtitle_path, sub_list.entries[0].path, sizeof(config.subtitle_path) - 1);
 		config.subtitle_path[sizeof(config.subtitle_path) - 1] = '\0';
 		config.subtitle_is_external = true;
-	} else if (!config.is_hevc) {
+	} else if (!VideoBrowser_isHEVC(entry->path)) {
 		// Embedded subs: only for non-HEVC files under 500MB.
 		// HEVC decode already saturates the CPU — adding the subtitle
 		// overlay filter on top causes frame drops or audio-only playback.
@@ -83,6 +79,8 @@ static SDL_Surface* play_video_file(SDL_Surface* screen, VideoFileEntry* entry, 
 
 	// Launch ffplay (releases PAD, waits, re-inits PAD)
 	FfplayEngine_play(&config);
+	// back in the browser: auto-sleep applies again
+	ModuleCommon_setAutosleepDisabled(false);
 
 	// Record where playback ended: mid-video -> save for resume;
 	// barely started or near the end -> clear
@@ -130,8 +128,8 @@ ModuleExitReason PlayerModule_run(SDL_Surface* screen) {
 		ContextMenuItem ctx_items[2];
 		int ctx_count = 0;
 		if (sel_resume_sec > 0)
-			ModuleCommon_ctxAdd(ctx_items, &ctx_count, "Play from Start", PLAYER_CTX_PLAY_START);
-		ModuleCommon_ctxAdd(ctx_items, &ctx_count, "Quit App", CTX_ID_QUIT);
+			ContextMenu_addItem(ctx_items, &ctx_count, "Play from Start", PLAYER_CTX_PLAY_START);
+		ContextMenu_addItem(ctx_items, &ctx_count, "Quit App", CTX_ID_QUIT);
 
 		// Handle global input (quit chord, MENU context menu, power)
 		GlobalInputResult global = ModuleCommon_handleGlobalInput(screen, &show_setting, ctx_items, ctx_count);

@@ -3,6 +3,7 @@
 #include "radio_catalog_parse.h"
 #include "net_cache.h"
 #include "tz_country.h"
+#include "file_util.h"
 #include "defines.h" // SHARED_USERDATA_PATH
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,28 +24,9 @@ static CuratedStation catalog_stations[MAX_CATALOG_STATIONS];
 static int catalog_station_count = 0;
 static char loaded_country_code[8] = "";
 
-// Read an entire file into a malloc'd, NUL-terminated buffer (caller frees).
-static char* read_file(const char* path) {
-	FILE* f = fopen(path, "rb");
-	if (!f)
-		return NULL;
-	fseek(f, 0, SEEK_END);
-	long sz = ftell(f);
-	fseek(f, 0, SEEK_SET);
-	if (sz < 0) {
-		fclose(f);
-		return NULL;
-	}
-	char* buf = malloc((size_t)sz + 1);
-	if (!buf) {
-		fclose(f);
-		return NULL;
-	}
-	size_t rd = fread(buf, 1, (size_t)sz, f);
-	fclose(f);
-	buf[rd] = '\0';
-	return buf;
-}
+// Largest cached API response read back (the country list and a 100-station
+// page are tens of KB)
+#define CATALOG_MAX_FILE_BYTES (4 * 1024 * 1024)
 
 void RadioCatalog_init(void) {
 	NetCache_ensureDir(SHARED_USERDATA_PATH "/music-player");
@@ -64,7 +46,7 @@ void RadioCatalog_cleanup(void) {
 int RadioCatalog_loadCountries(bool force, volatile bool* should_stop, volatile int* progress) {
 	if (NetCache_ensure(COUNTRIES_URL, COUNTRIES_CACHE, force, should_stop, progress) != 0)
 		return -1;
-	char* json = read_file(COUNTRIES_CACHE);
+	char* json = allocFileCapped(COUNTRIES_CACHE, CATALOG_MAX_FILE_BYTES, NULL);
 	if (!json)
 		return -1;
 	char home[8];
@@ -104,7 +86,7 @@ int RadioCatalog_loadCountryStations(const char* code, bool force,
 
 	if (NetCache_ensure(url, cache, force, should_stop, progress) != 0)
 		return -1;
-	char* json = read_file(cache);
+	char* json = allocFileCapped(cache, CATALOG_MAX_FILE_BYTES, NULL);
 	if (!json)
 		return -1;
 	int n = RadioCatalog_parseStations(json, catalog_stations, MAX_CATALOG_STATIONS, safe);
@@ -123,10 +105,4 @@ const CuratedStation* RadioCatalog_getStations(const char* code, int* count) {
 	}
 	*count = 0;
 	return catalog_stations;
-}
-
-int RadioCatalog_getStationCount(const char* code) {
-	if (code && strcmp(code, loaded_country_code) == 0)
-		return catalog_station_count;
-	return 0;
 }

@@ -380,7 +380,7 @@ int main(int argc, char* argv[]) {
 					// the switcher's readyResume clobbered the shared resume
 					// state; recompute it for the list's own selection so the
 					// hint bar doesn't show a stale RESUME
-					readyResume(top->entries->count > 0
+					readyResume(top->selected >= 0 && top->selected < top->entries->count
 									? top->entries->items[top->selected]
 									: NULL);
 				}
@@ -653,7 +653,6 @@ int main(int argc, char* argv[]) {
 				if (!GameList_pillAnimating() && !MenuTabs_underlineGliding() &&
 					!(RowView_consoleBackground() && RowView_animating())) {
 					updateBackgroundLayer(blackBG);
-					renderThumbnail(1, false);
 				}
 
 				GFX_clearLayers(LAYER_TRANSITION);
@@ -725,7 +724,6 @@ int main(int argc, char* argv[]) {
 		} else if (backgroundLayerPending() ||
 				   (GameList_scrollBusy() && !ContextMenu_isOpen())) {
 			updateBackgroundLayer(blackBG);
-			renderThumbnail(1, false);
 			// Same flash as the dirty pass (see gamelist.c / 81a0c40a): the idle
 			// marquee tick presents the screen itself (ScrollText_animateOnly ->
 			// GFX_scrollTextTexture -> PLAT_GPU_Flip), which would blink the
@@ -778,7 +776,7 @@ int main(int argc, char* argv[]) {
 		if (has_hdmi != had_hdmi) {
 			had_hdmi = has_hdmi;
 
-			Entry* entry = top->entries->count > 0
+			Entry* entry = top->selected >= 0 && top->selected < top->entries->count
 							   ? top->entries->items[top->selected]
 							   : NULL;
 			LOG_info("restarting after HDMI change... (%s)\n",

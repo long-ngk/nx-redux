@@ -6,34 +6,11 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "utils.h"
+
 // Longest line we can parse; anything longer passes through writes verbatim
 // (a schema "key = value" line never gets near this).
 #define LINE_MAX_LEN 1024
-
-// malloc'd file contents or NULL. Same shape as read_file_to_string in
-// emu_overlay_cfg.c; duplicated rather than exported — 20 lines vs a new
-// public symbol in a header three binaries share.
-static char* read_all(const char* path) {
-	FILE* f = fopen(path, "r");
-	if (!f)
-		return NULL;
-	fseek(f, 0, SEEK_END);
-	long len = ftell(f);
-	if (len < 0) {
-		fclose(f);
-		return NULL;
-	}
-	fseek(f, 0, SEEK_SET);
-	char* buf = (char*)malloc((size_t)len + 1);
-	if (!buf) {
-		fclose(f);
-		return NULL;
-	}
-	size_t read_len = fread(buf, 1, (size_t)len, f);
-	buf[read_len] = '\0';
-	fclose(f);
-	return buf;
-}
 
 // Linear scan of ALL sections by item->key: minarch cfg files carry no INI
 // sections, so emu_ovl_cfg_find_item (which matches on resolved section
@@ -57,11 +34,13 @@ static EmuOvlItem* find_schema_item(EmuOvlConfig* cfg, const char* key, int* out
 // (Config_getValue's contract in minarch's ma_config.c: key anchored at line start,
 // optionally behind a '-' lock marker, immediately followed by " = ").
 // Leading whitespace is deliberately NOT skipped — minarch would not match
-// such a line either. Returns false for non-matching lines ("bind Up = UP"
-// parses fine but fails the schema-key lookup downstream).
+// such a line either. Like Config_getValue, only the line ending ("\n",
+// "\r\n") is cut from the value; other trailing whitespace is part of it.
+// Returns false for non-matching lines ("bind Up = UP" parses fine but fails
+// the schema-key lookup downstream).
 static bool parse_cfg_line(char* line, char** key, char** val, bool* locked) {
 	size_t len = strlen(line);
-	while (len > 0 && isspace((unsigned char)line[len - 1]))
+	while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
 		line[--len] = '\0';
 	char* p = line;
 	bool lock = false;
@@ -93,22 +72,31 @@ static size_t peek_line(const char* cursor, char* buf, size_t buf_size) {
 	return raw_len;
 }
 
+// A key can occur more than once in one cfg (hand edits, old tools).
+// minarch's Config_getValue reads the FIRST line for a key in each layer (its
+// lock marker included) and ignores the rest, so both passes below do too.
+
 // One pass over one layer's content marking locked schema keys. Indices are
 // pre-prune: only prune_locked below consumes this map.
 static void apply_locks(EmuOvlConfig* cfg, const char* content,
 						bool locked[EMU_OVL_MAX_SECTIONS][EMU_OVL_MAX_ITEMS]) {
 	if (!content)
 		return;
+	bool seen[EMU_OVL_MAX_SECTIONS][EMU_OVL_MAX_ITEMS];
+	memset(seen, 0, sizeof(seen));
 	const char* cursor = content;
 	char buf[LINE_MAX_LEN];
 	while (*cursor) {
 		size_t raw_len = peek_line(cursor, buf, sizeof(buf));
 		char *key, *val;
 		bool lock;
-		if (parse_cfg_line(buf, &key, &val, &lock) && lock) {
+		if (parse_cfg_line(buf, &key, &val, &lock)) {
 			int s, i;
-			if (find_schema_item(cfg, key, &s, &i))
-				locked[s][i] = true;
+			if (find_schema_item(cfg, key, &s, &i) && !seen[s][i]) {
+				seen[s][i] = true;
+				if (lock)
+					locked[s][i] = true;
+			}
 		}
 		cursor += raw_len;
 	}
@@ -122,6 +110,8 @@ static void apply_values(EmuOvlConfig* cfg, const char* content,
 						 int vals[EMU_OVL_MAX_SECTIONS][EMU_OVL_MAX_ITEMS]) {
 	if (!content)
 		return;
+	bool seen[EMU_OVL_MAX_SECTIONS][EMU_OVL_MAX_ITEMS];
+	memset(seen, 0, sizeof(seen));
 	const char* cursor = content;
 	char buf[LINE_MAX_LEN];
 	while (*cursor) {
@@ -129,11 +119,14 @@ static void apply_values(EmuOvlConfig* cfg, const char* content,
 		cursor += raw_len;
 		char *key, *val;
 		bool lock;
-		if (!parse_cfg_line(buf, &key, &val, &lock) || lock)
+		if (!parse_cfg_line(buf, &key, &val, &lock))
 			continue;
 		int s, i;
 		EmuOvlItem* item = find_schema_item(cfg, key, &s, &i);
-		if (!item)
+		if (!item || seen[s][i])
+			continue; // a later duplicate: minarch never reads it
+		seen[s][i] = true;
+		if (lock)
 			continue;
 		int value;
 		if (emu_ovl_cfg_parse_value(item, val, &value)) {
@@ -196,28 +189,12 @@ static void prune_locked(EmuOvlConfig* cfg,
 	cfg->section_count = w;
 }
 
-// "<path>.tmp" -> fputs -> rename -> sync: a launch-time power cut leaves
-// either the old file or the new one, never a torn half.
+// writeFileAtomic ("<path>.tmp" -> fsync -> rename), then sync so the rename
+// is on the card too: a launch-time power cut leaves either the old file or
+// the new one, never a torn half.
 static int write_atomic(const char* path, const char* content) {
-	char tmp[1024 + 8];
-	if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp))
+	if (!writeFileAtomic(path, content, strlen(content)))
 		return -1;
-	FILE* f = fopen(tmp, "w");
-	if (!f)
-		return -1;
-	if (fputs(content, f) < 0) {
-		fclose(f);
-		unlink(tmp);
-		return -1;
-	}
-	if (fclose(f) != 0) {
-		unlink(tmp);
-		return -1;
-	}
-	if (rename(tmp, path) != 0) {
-		unlink(tmp);
-		return -1;
-	}
 	sync();
 	return 0;
 }
@@ -316,10 +293,10 @@ int opts_minarch_load(EmuOvlConfig* cfg, OptsMinarchState* st, OptsOverrideState
 
 	// System/default paths arrive pre-resolved from the shell; NULL or a
 	// missing file is simply an empty layer.
-	char* system_content = system_cfg_path ? read_all(system_cfg_path) : NULL;
-	char* default_content = default_cfg_path ? read_all(default_cfg_path) : NULL;
-	st->console_content = read_all(st->console_path);
-	st->game_content = st->per_game ? read_all(st->game_path) : NULL;
+	char* system_content = system_cfg_path ? allocFile((char*)system_cfg_path) : NULL;
+	char* default_content = default_cfg_path ? allocFile((char*)default_cfg_path) : NULL;
+	st->console_content = allocFile((char*)st->console_path);
+	st->game_content = st->per_game ? allocFile((char*)st->game_path) : NULL;
 	st->game_existed = (st->game_content != NULL);
 
 	// Lock pass over all four layers FIRST, then prune, so every value

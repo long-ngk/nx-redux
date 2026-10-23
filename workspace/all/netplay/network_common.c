@@ -17,6 +17,12 @@
 #include <ifaddrs.h>
 #include <net/if.h> // IFF_UP / IFF_LOOPBACK for NET_getLanInfo
 #include <errno.h>
+#include <poll.h>
+#include <time.h>
+
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0 // host builds (macOS) for the tests
+#endif
 
 // Default TCP configuration
 static const NET_TCPConfig DEFAULT_TCP_CONFIG = {
@@ -36,8 +42,8 @@ static const int SSID_CHARSET_LEN = 32;
 // in NET_sendDiscoveryBroadcast. Skips loopback by FLAG, not name, plus
 // interfaces that are down and virtual links (VPN tunnels, VM/container
 // bridges, peer-to-peer). Advertising one of those addresses sends the peer's
-// connect somewhere unreachable; same ruling and same prefix list as Device
-// Sync's get_own_ip (sync.c). wlan* still wins outright so a device with a
+// connect somewhere unreachable; Device Sync's get_own_ip (sync.c) uses it
+// too. wlan* still wins outright so a device with a
 // second link keeps advertising the radio; otherwise the FIRST real interface
 // is kept.
 //
@@ -105,12 +111,6 @@ void NET_getLocalIP(char* ip_out, size_t ip_size) {
 	NET_getLanInfo(ip_out, ip_size, NULL, 0);
 }
 
-bool NET_hasConnection(void) {
-	char ip[16];
-	NET_getLocalIP(ip, sizeof(ip));
-	return strcmp(ip, "0.0.0.0") != 0;
-}
-
 //////////////////////////////////////////////////////////////////////////////
 // TCP Socket Configuration
 //////////////////////////////////////////////////////////////////////////////
@@ -144,6 +144,91 @@ void NET_configureTCPSocket(int fd, const NET_TCPConfig* config) {
 		int keepalive = 1;
 		setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
 	}
+}
+
+static long long net_now_ms(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+// Waits until fd is ready for `events` or the deadline passes: 1 ready,
+// 0 timeout, -1 error/hangup without readable data.
+static int net_wait(int fd, short events, long long deadline) {
+	for (;;) {
+		// checked here, not left to poll: a socket can poll writable while
+		// send still says EAGAIN (send low-water mark), which would spin
+		long long left = deadline - net_now_ms();
+		if (left <= 0)
+			return 0;
+		struct pollfd pfd = {.fd = fd, .events = events};
+		int r = poll(&pfd, 1, (int)left);
+		if (r < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		if (r == 0)
+			return 0;
+		if (pfd.revents & events)
+			return 1;
+		// POLLERR/POLLHUP/POLLNVAL without the wanted readiness
+		return -1;
+	}
+}
+
+int NET_sendAll(int fd, const void* buf, size_t len, int timeout_ms) {
+	if (fd < 0)
+		return -1;
+	const char* p = buf;
+	long long deadline = net_now_ms() + timeout_ms;
+	while (len > 0) {
+		ssize_t n = send(fd, p, len, MSG_NOSIGNAL | MSG_DONTWAIT);
+		if (n > 0) {
+			p += n;
+			len -= (size_t)n;
+			deadline = net_now_ms() + timeout_ms; // progress: restart the clock
+			continue;
+		}
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+			return -1;
+		int w = net_wait(fd, POLLOUT, deadline);
+		if (w <= 0)
+			return w;
+	}
+	return 1;
+}
+
+int NET_recvAll(int fd, void* buf, size_t len, int timeout_ms, size_t* got) {
+	if (got)
+		*got = 0;
+	if (fd < 0)
+		return -1;
+	char* p = buf;
+	size_t done = 0;
+	long long deadline = net_now_ms() + timeout_ms;
+	while (done < len) {
+		ssize_t n = recv(fd, p + done, len - done, MSG_DONTWAIT);
+		if (n > 0) {
+			done += (size_t)n;
+			if (got)
+				*got = done;
+			deadline = net_now_ms() + timeout_ms; // progress: restart the clock
+			continue;
+		}
+		if (n == 0)
+			return -1; // orderly close
+		if (errno == EINTR)
+			continue;
+		if (errno != EAGAIN && errno != EWOULDBLOCK)
+			return -1;
+		int w = net_wait(fd, POLLIN, deadline);
+		if (w <= 0)
+			return w;
+	}
+	return 1;
 }
 
 //////////////////////////////////////////////////////////////////////////////

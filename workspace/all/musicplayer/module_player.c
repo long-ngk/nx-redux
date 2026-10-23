@@ -18,6 +18,7 @@
 
 extern uint32_t SDL_GetTicks(void);
 #include "module_common.h"
+#include "ui_toast.h"
 #include "module_player.h"
 #include "music_client.h"
 #include "spectrum.h"
@@ -186,17 +187,20 @@ static bool sync_ui_to_owner(void) {
 	 * persistence and next/previous diverge after a UI reattach. */
 	if (snapshot->queue_kind == MUSIC_QUEUE_M3U && snapshot->queue_path[0] &&
 		strcmp(resume_playlist_path, snapshot->queue_path) != 0) {
-		PlaylistTrack tracks[PLAYLIST_MAX_TRACKS];
+		// Loaded straight into a new heap playlist (500 tracks are ~386 KB)
+		PlaylistContext loaded = {0};
+		Playlist_init(&loaded);
 		int count = 0;
-		if (M3U_loadTracks(snapshot->queue_path, tracks, PLAYLIST_MAX_TRACKS, &count) == 0 && count > 0) {
+		if (loaded.tracks &&
+			M3U_loadTracks(snapshot->queue_path, loaded.tracks, PLAYLIST_MAX_TRACKS, &count) == 0 && count > 0) {
 			Playlist_free(&playlist);
-			Playlist_init(&playlist);
-			for (int i = 0; i < count; i++)
-				playlist.tracks[i] = tracks[i];
+			playlist = loaded;
 			playlist.track_count = count;
 			playlist.current_index = 0;
 			playlist_active = true;
 			snprintf(resume_playlist_path, sizeof(resume_playlist_path), "%s", snapshot->queue_path);
+		} else {
+			Playlist_free(&loaded);
 		}
 	} else if (snapshot->queue_kind == MUSIC_QUEUE_FOLDER && snapshot->queue_path[0] &&
 			   (strcmp(resume_folder_path, snapshot->queue_path) != 0 || !playlist_active)) {
@@ -666,15 +670,15 @@ ModuleExitReason PlayerModule_run(SDL_Surface* screen) {
 					FileEntry* e = &browser.entries[v->selected];
 					bool is_parent = e->is_dir && strcmp(e->name, "..") == 0;
 					if (!e->is_play_all && !is_parent) {
-						ModuleCommon_ctxAdd(ctx_items, &ctx_count,
+						ContextMenu_addItem(ctx_items, &ctx_count,
 											e->is_dir ? "Rename Folder" : "Rename File", PLAYER_CTX_RENAME);
-						ModuleCommon_ctxAdd(ctx_items, &ctx_count,
+						ContextMenu_addItem(ctx_items, &ctx_count,
 											e->is_dir ? "Delete Folder" : "Delete File", PLAYER_CTX_DELETE);
-						ModuleCommon_ctxAdd(ctx_items, &ctx_count,
+						ContextMenu_addItem(ctx_items, &ctx_count,
 											e->is_dir ? "Add Folder to Playlist" : "Add to Playlist", PLAYER_CTX_ADD);
 					}
 				}
-				ModuleCommon_ctxAdd(ctx_items, &ctx_count, "Quit App", CTX_ID_QUIT);
+				ContextMenu_addItem(ctx_items, &ctx_count, "Quit App", CTX_ID_QUIT);
 			}
 
 			GlobalInputResult global = ModuleCommon_handleGlobalInput(screen, &show_setting, app_state_for_help,
@@ -778,7 +782,7 @@ ModuleExitReason PlayerModule_run(SDL_Surface* screen) {
 			GFX_flip(screen);
 			dirty = 0;
 
-			ModuleCommon_tickToast(player_toast_message, player_toast_time, &dirty);
+			UI_tickToast(player_toast_message, player_toast_time, &dirty);
 		} else if (!screen_off) {
 			// Idle marquee tick for the browser view (activate-after-delay +
 			// steady GPU scroll happen here, not via dirty).
@@ -1190,9 +1194,12 @@ ModuleExitReason PlayerModule_runResume(SDL_Surface* screen, const ResumeState* 
 
 	} else if (resume->type == RESUME_TYPE_PLAYLIST) {
 		// Load the M3U playlist tracks
-		PlaylistTrack m3u_tracks[PLAYLIST_MAX_TRACKS];
+		// heap, not stack: 500 tracks are ~386 KB
+		PlaylistTrack* m3u_tracks = malloc(sizeof(PlaylistTrack) * PLAYLIST_MAX_TRACKS);
 		int m3u_count = 0;
-		if (M3U_loadTracks(resume->playlist_path, m3u_tracks, PLAYLIST_MAX_TRACKS, &m3u_count) != 0 || m3u_count <= 0) {
+		if (!m3u_tracks ||
+			M3U_loadTracks(resume->playlist_path, m3u_tracks, PLAYLIST_MAX_TRACKS, &m3u_count) != 0 || m3u_count <= 0) {
+			free(m3u_tracks);
 			return MODULE_EXIT_TO_MENU;
 		}
 
@@ -1210,6 +1217,7 @@ ModuleExitReason PlayerModule_runResume(SDL_Surface* screen, const ResumeState* 
 
 		// Run with the playlist
 		ModuleExitReason reason = PlayerModule_runWithPlaylist(screen, m3u_tracks, m3u_count, start_idx);
+		free(m3u_tracks);
 
 		resume_playlist_path[0] = '\0';
 		resume_folder_path[0] = '\0';

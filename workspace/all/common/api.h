@@ -296,11 +296,12 @@ void GFX_setScreen(SDL_Surface* s);								   // refresh the cached screen after
 #define GFX_animateSurface PLAT_animateSurface					   //(SDL_Surface *inputSurface,int x, int y)
 #define GFX_animateSurfaceOpacity PLAT_animateSurfaceOpacity	   //(SDL_Surface *inputSurface,int x, int y)
 #define GFX_animateSlidePages PLAT_animateSlidePages
-#define GFX_textShouldScroll PLAT_textShouldScroll	 // (TTF_Font* font, const char* in_name,int max_width, SDL_mutex* fontMutex);
-#define GFX_resetScrollText PLAT_resetScrollText	 // (void);
-#define GFX_scrollTextTexture PLAT_scrollTextTexture // (TTF_Font* font, const char* in_name,int x, int y, int w, int h, SDL_Color color, float transparency, SDL_mutex* fontMutex);
-#define GFX_flipHidden PLAT_flipHidden				 //(void)
-#define GFX_GL_screenCapture PLAT_GL_screenCapture	 //(void)
+#define GFX_textShouldScroll PLAT_textShouldScroll			 // (TTF_Font* font, const char* in_name,int max_width, SDL_mutex* fontMutex);
+#define GFX_resetScrollText PLAT_resetScrollText			 // (void);
+#define GFX_scrollTextTexture PLAT_scrollTextTexture		 // (TTF_Font* font, const char* in_name,int x, int y, int w, int h, SDL_Color color, float transparency, SDL_mutex* fontMutex);
+#define GFX_flipHidden PLAT_flipHidden						 //(void)
+#define GFX_GL_screenCapture PLAT_GL_screenCapture			 //(void)
+#define GFX_GL_screenCaptureClean PLAT_GL_screenCaptureClean //(void)
 
 void GFX_setMode(int mode);
 SDL_Color uintToColour(uint32_t rgba); // packed 0xRRGGBBAA
@@ -352,11 +353,13 @@ SDL_Surface* GFX_renderText(TTF_Font* primary, const char* utf8, SDL_Color color
 void GFX_measureText(TTF_Font* primary, const char* utf8, int* w, int* h);
 SDL_Surface* GFX_renderTextWrapped(TTF_Font* primary, const char* utf8, SDL_Color color, uint32_t wrap_w);
 
-int GFX_truncateText(TTF_Font* font, const char* in_name, char* out_name, int max_width, int padding); // returns final width
-// `text` as it fits `avail` px with `padding` (GFX_truncateText when it doesn't) into out (256 bytes), its own width in
-// *raw_w; true when truncated. Remembered per font, text and room (dropped with the text cache), so a list's rows
-// aren't measured every frame.
-bool GFX_fitTextCached(TTF_Font* font, const char* text, char* out, int avail, int padding, int* raw_w);
+// in_name cut with "..." to max_width into out_name (out_size bytes, never overrun); returns final width
+int GFX_truncateText(TTF_Font* font, const char* in_name, char* out_name, size_t out_size, int max_width, int padding);
+// `text` as it fits `avail` px with `padding` (GFX_truncateText when it doesn't) into out (out_size bytes), its own
+// width in *raw_w; true when truncated. Remembered per font, text and room (dropped with the text cache), so a list's
+// rows aren't measured every frame.
+bool GFX_fitTextCached(TTF_Font* font, const char* text, char* out, size_t out_size, int avail, int padding,
+					   int* raw_w);
 // How many GFX_flip calls so far: a caller that keeps what its last frame left in the screen checks that nothing else
 // (a dialog, an overlay) has flipped a screen of its own since.
 unsigned GFX_flipCount(void);
@@ -365,7 +368,8 @@ unsigned GFX_flipCount(void);
 bool GFX_pillSprites(int asset, const SDL_Rect* rect, uint32_t asset_color, const SDL_Rect* clip);
 int PLAT_textShouldScroll(TTF_Font* font, const char* in_name, int max_width, SDL_mutex* fontMutex);
 void PLAT_resetScrollText(void);
-int GFX_getTextWidth(TTF_Font* font, const char* in_name, char* out_name, int max_width, int padding); // returns final width
+int GFX_getTextWidth(TTF_Font* font, const char* in_name, char* out_name, size_t out_size, int max_width,
+					 int padding); // returns final width
 int GFX_wrapText(TTF_Font* font, char* str, int max_width, int max_lines);
 int GFX_blitWrappedText(TTF_Font* font, const char* text, int max_width, int max_lines, SDL_Color color, SDL_Surface* surface, int y); // returns new y position
 
@@ -462,7 +466,7 @@ typedef struct SND_Frame {
 } SND_Frame;
 
 typedef struct {
-	SND_Frame* frames; // malloc'd by resample_audio(); the caller owns it and must free() it
+	SND_Frame* frames; // owned by resample_audio() and reused: valid until its next call
 	int frame_count;
 } ResampledFrames;
 
@@ -603,6 +607,7 @@ void PWR_captureStatus(int* screenshot_armed, int* recording);
 void PWR_updateFrequency(int secs, int updateWifi);
 
 void PWR_disablePowerOff(void);
+void PWR_enablePowerOff(void);
 void PWR_powerOff(int reboot);
 
 void PWR_sleep(void);
@@ -771,6 +776,7 @@ void GFX_GL_Swap();
 void GFX_GL_noteFrame(void);	   // GFX_GL_Swap's frame-rate bookkeeping alone
 void PLAT_GL_releaseCurrent(void); // no GL context current on this thread
 unsigned char* PLAT_GL_screenCapture(int* outWidth, int* outHeight);
+unsigned char* PLAT_GL_screenCaptureClean(int* outWidth, int* outHeight);
 void PLAT_GPU_Flip();
 
 // GPU sprites over the screen layer (a frame's moving pictures drawn by the GPU instead of blended into the screen):

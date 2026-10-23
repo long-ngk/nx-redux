@@ -37,6 +37,7 @@
 #include "audio/minimp4.h"
 #include <src/aacdecoder_lib.h>
 #include <opusfile.h>
+#include "audio_downmix.h"
 
 // M4A decoder state (uses minimp4 + FDK-AAC)
 typedef struct {
@@ -521,6 +522,9 @@ static int stream_decoder_open(StreamDecoder* sd, const char* filepath, TrackInf
 			LOG_error("Stream: Failed to init AAC decoder for M4A: %s\n", filepath);
 			return -1;
 		}
+		// Mix multichannel (5.1) down to stereo inside FDK: decode_buf below
+		// only holds 2048 stereo frames, and the copy assumes <= 2 channels.
+		aacDecoder_SetParam(m4a->aac_decoder, AAC_PCM_MAX_OUTPUT_CHANNELS, 2);
 
 		// Configure decoder with AudioSpecificConfig from MP4 container
 		if (track->dsi && track->dsi_bytes > 0) {
@@ -602,6 +606,8 @@ static int stream_decoder_open(StreamDecoder* sd, const char* filepath, TrackInf
 			LOG_error("Stream: Failed to init AAC decoder for: %s\n", filepath);
 			return -1;
 		}
+		// Stereo mix-down for multichannel streams (see the M4A case)
+		aacDecoder_SetParam(aac->aac_decoder, AAC_PCM_MAX_OUTPUT_CHANNELS, 2);
 
 		// Read initial chunk and decode first frame to get stream info
 		aac->read_buf_size = fread(aac->read_buf, 1, AAC_FILE_READ_BUF_SIZE, aac->file);
@@ -695,35 +701,33 @@ static size_t stream_decoder_read(StreamDecoder* sd, int16_t* buffer, size_t fra
 	}
 	case AUDIO_FORMAT_WAV: {
 		drwav* wav = (drwav*)sd->decoder;
-		if (sd->source_channels == 1) {
-			int16_t* mono = malloc(frames * sizeof(int16_t));
-			if (mono) {
-				frames_read = drwav_read_pcm_frames_s16(wav, frames, mono);
-				for (size_t i = 0; i < frames_read; i++) {
-					buffer[i * 2] = mono[i];
-					buffer[i * 2 + 1] = mono[i];
-				}
-				free(mono);
-			}
-		} else {
+		if (sd->source_channels == 2) {
 			frames_read = drwav_read_pcm_frames_s16(wav, frames, buffer);
+		} else if (sd->source_channels > 0) {
+			// Mono or multichannel (e.g. 5.1): decode at the file's channel
+			// count into scratch, then mix to the stereo output buffer.
+			int16_t* scratch = malloc(frames * (size_t)sd->source_channels * sizeof(int16_t));
+			if (scratch) {
+				frames_read = drwav_read_pcm_frames_s16(wav, frames, scratch);
+				AudioDownmix_toStereo(scratch, sd->source_channels, frames_read, buffer);
+				free(scratch);
+			}
 		}
 		break;
 	}
 	case AUDIO_FORMAT_FLAC: {
 		drflac* flac = (drflac*)sd->decoder;
-		if (sd->source_channels == 1) {
-			int16_t* mono = malloc(frames * sizeof(int16_t));
-			if (mono) {
-				frames_read = drflac_read_pcm_frames_s16(flac, frames, mono);
-				for (size_t i = 0; i < frames_read; i++) {
-					buffer[i * 2] = mono[i];
-					buffer[i * 2 + 1] = mono[i];
-				}
-				free(mono);
-			}
-		} else {
+		if (sd->source_channels == 2) {
 			frames_read = drflac_read_pcm_frames_s16(flac, frames, buffer);
+		} else if (sd->source_channels > 0) {
+			// Mono or multichannel (e.g. 5.1): decode at the file's channel
+			// count into scratch, then mix to the stereo output buffer.
+			int16_t* scratch = malloc(frames * (size_t)sd->source_channels * sizeof(int16_t));
+			if (scratch) {
+				frames_read = drflac_read_pcm_frames_s16(flac, frames, scratch);
+				AudioDownmix_toStereo(scratch, sd->source_channels, frames_read, buffer);
+				free(scratch);
+			}
 		}
 		break;
 	}
@@ -1939,12 +1943,6 @@ static uint32_t read_syncsafe_int(const uint8_t* data) {
 		   ((uint32_t)(data[3] & 0x7F));
 }
 
-// Helper: read big-endian 32-bit integer
-static uint32_t read_be32(const uint8_t* data) {
-	return ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) |
-		   ((uint32_t)data[2] << 8) | (uint32_t)data[3];
-}
-
 // Helper: copy string, trimming trailing spaces
 static void copy_metadata_string(char* dest, const char* src, size_t max_len) {
 	if (!src || !dest || max_len == 0)
@@ -2049,6 +2047,34 @@ static void adopt_embedded_picture(const uint8_t* data, size_t size, uint32_t ty
 	album_art_is_front = is_front;
 }
 
+// Title/artist/album text frames and APIC pictures of an ID3v2 tag
+static void id3v2_frame(const char* frame_id, const uint8_t* frame_data, size_t frame_size, void* ctx) {
+	(void)ctx;
+	// Process text frames (TIT2, TPE1, TALB, etc.)
+	if (frame_id[0] == 'T' && frame_size > 1) {
+		uint8_t encoding = frame_data[0];
+		char temp[256];
+		TagMeta_id3Text(encoding, &frame_data[1], frame_size - 1, temp, sizeof(temp));
+
+		// Assign to appropriate field
+		if (strcmp(frame_id, "TIT2") == 0 && temp[0]) { // Title
+			copy_metadata_string(player.track_info.title, temp, sizeof(player.track_info.title));
+		} else if (strcmp(frame_id, "TPE1") == 0 && temp[0]) { // Artist
+			copy_metadata_string(player.track_info.artist, temp, sizeof(player.track_info.artist));
+		} else if (strcmp(frame_id, "TALB") == 0 && temp[0]) { // Album
+			copy_metadata_string(player.track_info.album, temp, sizeof(player.track_info.album));
+		}
+	}
+	// Process APIC frame (album art)
+	else if (strcmp(frame_id, "APIC") == 0) {
+		const uint8_t* image;
+		size_t image_size;
+		uint32_t pic_type;
+		if (TagMeta_id3Picture(frame_data, frame_size, &image, &image_size, &pic_type))
+			adopt_embedded_picture(image, image_size, pic_type);
+	}
+}
+
 // Parse ID3v2 tag (at beginning of file)
 static void parse_id3v2(const char* filepath) {
 	FILE* f = fopen(filepath, "rb");
@@ -2068,6 +2094,7 @@ static void parse_id3v2(const char* filepath) {
 	}
 
 	uint8_t version_major = header[3]; // 3 = ID3v2.3, 4 = ID3v2.4
+	uint8_t flags = header[5];
 	uint32_t tag_size = read_syncsafe_int(&header[6]);
 
 	// Cap the allocation: the syncsafe field allows up to 256MB, which an
@@ -2092,62 +2119,9 @@ static void parse_id3v2(const char* filepath) {
 	}
 	fclose(f);
 
-	// Parse frames
-	uint32_t pos = 0;
-	while (pos + 10 < tag_size) {
-		// Frame header: ID(4) + Size(4) + Flags(2)
-		char frame_id[5];
-		memcpy(frame_id, &tag_data[pos], 4);
-		frame_id[4] = '\0';
-
-		// Check for padding (all zeros)
-		if (frame_id[0] == '\0')
-			break;
-
-		uint32_t frame_size;
-		if (version_major == 4) {
-			frame_size = read_syncsafe_int(&tag_data[pos + 4]);
-		} else {
-			frame_size = read_be32(&tag_data[pos + 4]);
-		}
-
-		// Skip flags
-		pos += 10;
-
-		// Bounds check without adding: pos + frame_size can wrap in uint32_t
-		// (frame_size is an untrusted 32-bit big-endian value in v2.2/v2.3),
-		// so compute the remaining space instead. pos <= tag_size here because
-		// the loop guard was `pos + 10 < tag_size` before the += 10.
-		if (frame_size == 0 || frame_size > tag_size - pos)
-			break;
-
-		// Process text frames (TIT2, TPE1, TALB, etc.)
-		if (frame_id[0] == 'T' && frame_size > 1) {
-			const uint8_t* frame_data = &tag_data[pos];
-			uint8_t encoding = frame_data[0];
-			char temp[256];
-			TagMeta_id3Text(encoding, &frame_data[1], frame_size - 1, temp, sizeof(temp));
-
-			// Assign to appropriate field
-			if (strcmp(frame_id, "TIT2") == 0 && temp[0]) { // Title
-				copy_metadata_string(player.track_info.title, temp, sizeof(player.track_info.title));
-			} else if (strcmp(frame_id, "TPE1") == 0 && temp[0]) { // Artist
-				copy_metadata_string(player.track_info.artist, temp, sizeof(player.track_info.artist));
-			} else if (strcmp(frame_id, "TALB") == 0 && temp[0]) { // Album
-				copy_metadata_string(player.track_info.album, temp, sizeof(player.track_info.album));
-			}
-		}
-		// Process APIC frame (album art)
-		else if (strcmp(frame_id, "APIC") == 0) {
-			const uint8_t* image;
-			size_t image_size;
-			uint32_t pic_type;
-			if (TagMeta_id3Picture(&tag_data[pos], frame_size, &image, &image_size, &pic_type))
-				adopt_embedded_picture(image, image_size, pic_type);
-		}
-
-		pos += frame_size;
-	}
+	// Parse frames (extended header, unsynchronisation and data length
+	// indicators handled by the shared walker)
+	TagMeta_id3Frames(version_major, flags, tag_data, tag_size, id3v2_frame, NULL);
 
 	free(tag_data);
 }
@@ -2604,11 +2578,6 @@ void Player_setPlaybackSpeed(float speed) {
 	pthread_mutex_unlock(&player.mutex);
 }
 
-float Player_getPlaybackSpeed(void) {
-	PlayerSnapshot snapshot;
-	return Player_getSnapshot(&snapshot) == 0 ? snapshot.playback_speed : 1.0f;
-}
-
 void Player_setRepeat(bool repeat) {
 	pthread_mutex_lock(&player.mutex);
 	player.repeat = repeat;
@@ -2652,34 +2621,9 @@ int Player_getDuration(void) {
 	return Player_getSnapshot(&snapshot) == 0 ? snapshot.track_info.duration_ms : 0;
 }
 
-const TrackInfo* Player_getTrackInfo(void) {
-	static __thread TrackInfo track_info;
-	PlayerSnapshot snapshot;
-	if (Player_getSnapshot(&snapshot) != 0)
-		memset(&track_info, 0, sizeof(track_info));
-	else
-		track_info = snapshot.track_info;
-	return &track_info;
-}
-
-int Player_getSourceSampleRate(void) {
-	PlayerSnapshot snapshot;
-	return Player_getSnapshot(&snapshot) == 0 ? snapshot.source_sample_rate : 0;
-}
-
 int Player_getOutputSampleRate(void) {
 	PlayerSnapshot snapshot;
 	return Player_getSnapshot(&snapshot) == 0 ? snapshot.output_sample_rate : 0;
-}
-
-const char* Player_getCurrentFile(void) {
-	static __thread char current_file[sizeof(player.current_file)];
-	PlayerSnapshot snapshot;
-	if (Player_getSnapshot(&snapshot) != 0)
-		current_file[0] = '\0';
-	else
-		memcpy(current_file, snapshot.current_file, sizeof(current_file));
-	return current_file;
 }
 
 int Player_getVisBuffer(int16_t* buffer, int max_samples) {

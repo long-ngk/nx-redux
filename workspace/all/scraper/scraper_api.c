@@ -1,10 +1,13 @@
 #include "scraper_api.h"
+#include "scraper_parse.h"
 #include "http.h"
 #include "cjson/cJSON.h"
 #include "utils.h"
 #include "api.h"
 #include "wifi.h"
+#include "ca_bundle.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,43 +44,17 @@ static void ss_decodeDevCredentials(char* devid, char* devpass) {
 }
 #endif
 
+// The UI thread (account info) and the scrape worker (searches) both make requests: one limiter for both, so the
+// interval holds across them.
+static pthread_mutex_t rate_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t last_request_time = 0;
 static char ss_username[64] = "";
 static char ss_password[128] = "";
 
-// Shell-escape a string for safe use in system() calls (wraps in single quotes)
-static char* shell_escape(const char* str) {
-	if (!str)
-		return strdup("''");
-	size_t len = strlen(str);
-	size_t quotes = 0;
-	for (size_t i = 0; i < len; i++) {
-		if (str[i] == '\'')
-			quotes++;
-	}
-	char* escaped = malloc(len + quotes * 3 + 3);
-	if (!escaped)
-		return NULL;
-	char* p = escaped;
-	*p++ = '\'';
-	for (size_t i = 0; i < len; i++) {
-		if (str[i] == '\'') {
-			*p++ = '\'';
-			*p++ = '"';
-			*p++ = '\'';
-			*p++ = '"';
-			*p++ = '\'';
-		} else {
-			*p++ = str[i];
-		}
-	}
-	*p++ = '\'';
-	*p = '\0';
-	return escaped;
-}
-
 void ScraperAPI_init(void) {
+	pthread_mutex_lock(&rate_lock);
 	last_request_time = 0;
+	pthread_mutex_unlock(&rate_lock);
 	ss_username[0] = '\0';
 	ss_password[0] = '\0';
 }
@@ -98,16 +75,17 @@ bool ScraperAPI_hasUserCredentials(void) {
 }
 
 void ScraperAPI_rateLimit(void) {
-	if (last_request_time == 0) {
-		last_request_time = getMicroseconds();
-		return;
-	}
-	uint64_t now = getMicroseconds();
-	uint64_t elapsed_ms = (now - last_request_time) / 1000;
-	if (elapsed_ms < SS_RATE_LIMIT_MS) {
-		usleep((SS_RATE_LIMIT_MS - elapsed_ms) * 1000);
+	// held across the wait: a second caller waits its own full interval after this one
+	pthread_mutex_lock(&rate_lock);
+	if (last_request_time != 0) {
+		uint64_t now = getMicroseconds();
+		uint64_t elapsed_ms = (now - last_request_time) / 1000;
+		if (elapsed_ms < SS_RATE_LIMIT_MS) {
+			usleep((SS_RATE_LIMIT_MS - elapsed_ms) * 1000);
+		}
 	}
 	last_request_time = getMicroseconds();
+	pthread_mutex_unlock(&rate_lock);
 }
 
 bool ScraperAPI_isOnline(void) {
@@ -115,54 +93,6 @@ bool ScraperAPI_isOnline(void) {
 	// status is stale-false for the first poll interval of a fresh process,
 	// which made these gates report "No Network" right after launch.
 	return Wifi_isConnected();
-}
-
-// Region priority: us > wor > eu > any
-static const char* region_priority[] = {"us", "wor", "eu", NULL};
-
-// Extract preferred media URL from medias array
-// Tries types in preference order, then regions by priority
-static void extractMediaURL(cJSON* medias, const char** types, int type_count,
-							char* out_url, int url_size) {
-	out_url[0] = '\0';
-
-	for (int t = 0; t < type_count; t++) {
-		// First pass: try each preferred region in priority order
-		for (int r = 0; region_priority[r] != NULL; r++) {
-			cJSON* media;
-			cJSON_ArrayForEach(media, medias) {
-				cJSON* type = cJSON_GetObjectItem(media, "type");
-				if (!type || !cJSON_IsString(type))
-					continue;
-				if (strcmp(type->valuestring, types[t]) != 0)
-					continue;
-				cJSON* region = cJSON_GetObjectItem(media, "region");
-				cJSON* url = cJSON_GetObjectItem(media, "url");
-				if (!url || !cJSON_IsString(url))
-					continue;
-				if (region && cJSON_IsString(region) &&
-					strcmp(region->valuestring, region_priority[r]) == 0) {
-					snprintf(out_url, url_size, "%s", url->valuestring);
-					return;
-				}
-			}
-		}
-
-		// Second pass: take any available for this type
-		cJSON* media;
-		cJSON_ArrayForEach(media, medias) {
-			cJSON* type = cJSON_GetObjectItem(media, "type");
-			if (!type || !cJSON_IsString(type))
-				continue;
-			if (strcmp(type->valuestring, types[t]) != 0)
-				continue;
-			cJSON* url = cJSON_GetObjectItem(media, "url");
-			if (!url || !cJSON_IsString(url))
-				continue;
-			snprintf(out_url, url_size, "%s", url->valuestring);
-			return;
-		}
-	}
 }
 
 static bool computeCRC32(const char* filepath, uint32_t* out_crc, long* out_size) {
@@ -191,76 +121,16 @@ static bool parseSearchResponse(HTTP_Response* resp, ScraperGameInfo* info) {
 		return false;
 	}
 
-	cJSON* root = cJSON_Parse(resp->data);
+	bool found = ScraperParse_gameInfo(resp->data, info);
 	HTTP_freeResponse(resp);
-	if (!root)
+	if (!found)
 		return false;
 
-	cJSON* response = cJSON_GetObjectItem(root, "response");
-	if (!response) {
-		cJSON_Delete(root);
-		return false;
-	}
+	// which media were found, not their URLs: ScreenScraper's carry the dev and user passwords as query parameters
+	LOG_info("Scraper: game='%s' ss=%s box=%s box2d=%s wheel=%s\n", info->game_name,
+			 info->screenshot_url[0] ? "yes" : "no", info->boxart_url[0] ? "yes" : "no",
+			 info->boxart2d_url[0] ? "yes" : "no", info->wheel_url[0] ? "yes" : "no");
 
-	cJSON* jeu = cJSON_GetObjectItem(response, "jeu");
-	if (!jeu) {
-		cJSON_Delete(root);
-		return false;
-	}
-
-	info->found = true;
-
-	// Extract game name (prefer English, fallback to any)
-	cJSON* noms = cJSON_GetObjectItem(jeu, "noms");
-	if (noms && cJSON_IsArray(noms)) {
-		cJSON* nom;
-		bool got_name = false;
-		cJSON_ArrayForEach(nom, noms) {
-			cJSON* region = cJSON_GetObjectItem(nom, "region");
-			cJSON* text = cJSON_GetObjectItem(nom, "text");
-			if (!text || !cJSON_IsString(text))
-				continue;
-			if (!got_name) {
-				snprintf(info->game_name, sizeof(info->game_name), "%s", text->valuestring);
-				got_name = true;
-			}
-			if (region && cJSON_IsString(region) &&
-				(strcmp(region->valuestring, "us") == 0 ||
-				 strcmp(region->valuestring, "wor") == 0 ||
-				 strcmp(region->valuestring, "eu") == 0)) {
-				snprintf(info->game_name, sizeof(info->game_name), "%s", text->valuestring);
-				break;
-			}
-		}
-	}
-
-	// Extract media URLs
-	cJSON* medias = cJSON_GetObjectItem(jeu, "medias");
-	if (medias && cJSON_IsArray(medias)) {
-		const char* screenshot_types[] = {"ss", "sstitle"};
-		extractMediaURL(medias, screenshot_types, 2,
-						info->screenshot_url, sizeof(info->screenshot_url));
-
-		const char* boxart_types[] = {"box-3D", "box-2D"};
-		extractMediaURL(medias, boxart_types, 2,
-						info->boxart_url, sizeof(info->boxart_url));
-
-		const char* boxart2d_types[] = {"box-2D"};
-		extractMediaURL(medias, boxart2d_types, 1,
-						info->boxart2d_url, sizeof(info->boxart2d_url));
-
-		const char* wheel_types[] = {"wheel-hd", "wheel"};
-		extractMediaURL(medias, wheel_types, 2,
-						info->wheel_url, sizeof(info->wheel_url));
-	}
-
-	LOG_info("Scraper: game='%s' ss='%s' box='%s' wheel='%s'\n",
-			 info->game_name,
-			 info->screenshot_url[0] ? info->screenshot_url : "(none)",
-			 info->boxart_url[0] ? info->boxart_url : "(none)",
-			 info->wheel_url[0] ? info->wheel_url : "(none)");
-
-	cJSON_Delete(root);
 	return true;
 }
 
@@ -406,21 +276,35 @@ bool ScraperAPI_downloadFile(const char* url, const char* dest_path) {
 		return false;
 
 	// Shell-escape both arguments to prevent injection
-	char* escaped_url = shell_escape(url);
-	char* escaped_path = shell_escape(dest_path);
+	char* escaped_url = shellQuoteAlloc(url);
+	char* escaped_path = shellQuoteAlloc(dest_path);
 	if (!escaped_url || !escaped_path) {
 		free(escaped_url);
 		free(escaped_path);
 		return false;
 	}
 
-	// Use curl for binary downloads since HTTP module is text-oriented
+	// TLS checked against the shipped CA bundle like every other fetch (-k only when there is none)
+	const char* ca_bundle = nx_ca_bundle_path();
+	char* escaped_ca = ca_bundle ? shellQuoteAlloc(ca_bundle) : NULL;
+	char tls_opt[MAX_PATH * 4 + 16];
+	if (escaped_ca)
+		snprintf(tls_opt, sizeof(tls_opt), "--cacert %s", escaped_ca);
+	else
+		snprintf(tls_opt, sizeof(tls_opt), "-k");
+	free(escaped_ca);
+
+	// Use curl for binary downloads since HTTP module is text-oriented. --fail: an HTTP error (quota, 404) is a
+	// failed download, not an error page saved as the image.
 	char cmd[4096];
-	snprintf(cmd, sizeof(cmd),
-			 "curl -s -k -L -o %s --connect-timeout 10 --max-time 30 %s",
-			 escaped_path, escaped_url);
+	int n = snprintf(cmd, sizeof(cmd), "curl -s --fail %s -L -o %s --connect-timeout 10 --max-time 30 %s", tls_opt,
+					 escaped_path, escaped_url);
 	free(escaped_url);
 	free(escaped_path);
+	if (n < 0 || (size_t)n >= sizeof(cmd)) {
+		LOG_error("Scraper download: command too long for %s\n", dest_path);
+		return false;
+	}
 
 	// Log only the destination: ScreenScraper media URLs carry the dev and
 	// user passwords as query parameters.

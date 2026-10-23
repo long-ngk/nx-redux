@@ -15,6 +15,8 @@
 #include "collname.h"
 #include "romkey.h"
 #include "emulist_model.h"
+#include "entry_cache.h"
+#include "entry_names.h"
 #include "api.h"
 
 static bool _simple_mode = false;
@@ -35,80 +37,7 @@ void Content_setSimpleMode(bool mode) {
 }
 
 ///////////////////////////////////////
-// Helpers
-
-// The letter-jump group of a name, in EntryArray_sort's order (strcasecmp: bytes compared after tolower): 0 for
-// what sorts before 'a' (digits, most punctuation), 1-26 for a-z, 27 for what sorts after 'z' ("{|}~" and every
-// UTF-8 lead byte), so each group is one run of the sorted list.
-static int getIndexChar(char* str) {
-	int c = tolower((unsigned char)str[0]);
-	if (c >= 'a' && c <= 'z')
-		return (c - 'a') + 1;
-	return c > 'z' ? 27 : 0;
-}
-
-static void getUniqueName(Entry* entry, char* out_name) {
-	char* slash = strrchr(entry->path, '/');
-	if (!slash)
-		return;
-	char emu_tag[MAX_PATH];
-	getEmuName(entry->path, emu_tag);
-	snprintf(out_name, MAX_PATH, "%s (%s)", entry->name, emu_tag);
-}
-
-// stem of a path: its basename with trailing 1-4 letter extensions removed,
-// matching getDisplayName()'s rule so multi-extensions (e.g. .p8.png) collapse.
-static void getFileStem(const char* path, char* out /* MAX_PATH */) {
-	const char* base = baseName(path);
-	snprintf(out, MAX_PATH, "%s", base);
-	char* tmp;
-	while ((tmp = strrchr(out, '.')) != NULL) {
-		int len = strlen(tmp);
-		if (len > 2 && len <= 5)
-			tmp[0] = '\0'; // 1-4 letter extension plus dot
-		else
-			break;
-	}
-	if (out[0] == '\0')
-		snprintf(out, MAX_PATH, "%s", base); // stripping ate everything; restore the basename
-}
-
-///////////////////////////////////////
-// Directory indexing
-
-// Parse a map.txt: one "<key>\t<display name>" line per entry, blank lines
-// skipped. Returns NULL if the file cannot be opened (missing or unreadable),
-// else a Hash the caller must Hash_free.
-static Hash* readMapFile(const char* map_path) {
-	FILE* file = fopen(map_path, "r");
-	if (!file)
-		return NULL;
-	Hash* map = Hash_new();
-	char line[MAX_PATH];
-	while (fgets(line, sizeof(line), file) != NULL) {
-		normalizeNewline(line);
-		trimTrailingNewlines(line);
-		if (strlen(line) == 0)
-			continue; // skip empty lines
-
-		char* tmp = strchr(line, '\t');
-		if (tmp) {
-			tmp[0] = '\0';
-			char* key = line;
-			char* value = tmp + 1;
-			// the name ends at the next tab (a stray third column) and loses trailing blanks and a lone CR: the
-			// caches are tab-separated, and a tab in a name made the Consoles cache unreadable (a rescan every boot)
-			value[strcspn(value, "\t")] = '\0';
-			size_t len = strlen(value);
-			while (len > 0 && isspace((unsigned char)value[len - 1]))
-				value[--len] = '\0';
-			if (len > 0) // an empty name would show as a blank row
-				Hash_set(map, key, value);
-		}
-	}
-	fclose(file);
-	return map;
-}
+// Directory indexing (the naming rules are entry_names.c's)
 
 // Arcade titles for ROMs with no map.txt alias (see arcade_names.h), keyed by
 // the Roms folder's emulator tag. Each table is loaded on first use and kept
@@ -170,6 +99,37 @@ static bool arcadeQualifier(Hash* map, const Entry* entry, const char** qualifie
 	return true;
 }
 
+// The scratch arrays ArcadeNames_disambiguate fills for n rows sharing a title: labels[k] points into one block of
+// n MAX_PATH buffers.
+typedef struct {
+	const char** qualifiers;
+	const char** filenames;
+	char** labels;
+	char* bufs;
+} ArcadeLabels;
+
+static void ArcadeLabels_free(ArcadeLabels* l) {
+	free(l->bufs);
+	free(l->labels);
+	free(l->filenames);
+	free(l->qualifiers);
+}
+
+// False (with nothing left to free) when out of memory.
+static bool ArcadeLabels_alloc(ArcadeLabels* l, int n) {
+	l->qualifiers = calloc(n, sizeof(char*));
+	l->filenames = calloc(n, sizeof(char*));
+	l->labels = calloc(n, sizeof(char*));
+	l->bufs = calloc(n, MAX_PATH);
+	if (!l->qualifiers || !l->filenames || !l->labels || !l->bufs) {
+		ArcadeLabels_free(l);
+		return false;
+	}
+	for (int k = 0; k < n; k++)
+		l->labels[k] = l->bufs + k * MAX_PATH;
+	return true;
+}
+
 // Label each row of a same-folder run of arcade clones sharing one title by
 // region or DAT qualifier: "Alien vs. Predator (Japan)" rather than "avspj";
 // a lone unqualified parent set keeps the bare title, and clones the
@@ -177,33 +137,28 @@ static bool arcadeQualifier(Hash* map, const Entry* entry, const char** qualifie
 // nothing, when any row is not table-named.
 static bool arcadeLabelRun(Directory* self, Hash* map, int start, int end) {
 	int n = end - start;
-	const char** qualifiers = calloc(n, sizeof(char*));
-	const char** filenames = calloc(n, sizeof(char*));
-	char** labels = calloc(n, sizeof(char*));
-	char* bufs = calloc(n, MAX_PATH);
-	bool ok = qualifiers && filenames && labels && bufs;
+	ArcadeLabels l;
+	if (!ArcadeLabels_alloc(&l, n))
+		return false;
+	bool ok = true;
 	for (int k = 0; ok && k < n; k++) {
 		Entry* e = self->entries->items[start + k];
-		labels[k] = bufs + k * MAX_PATH;
-		filenames[k] = baseName(e->path);
-		ok = arcadeQualifier(map, e, &qualifiers[k]);
+		l.filenames[k] = baseName(e->path);
+		ok = arcadeQualifier(map, e, &l.qualifiers[k]);
 	}
 	if (ok)
-		ok = ArcadeNames_disambiguate(qualifiers, filenames, n, labels, MAX_PATH);
+		ok = ArcadeNames_disambiguate(l.qualifiers, l.filenames, n, l.labels, MAX_PATH);
 	for (int k = 0; ok && k < n; k++) {
 		Entry* e = self->entries->items[start + k];
 		char buf[MAX_PATH];
-		if (labels[k][0])
-			snprintf(buf, sizeof(buf), "%s %s", e->name, labels[k]);
+		if (l.labels[k][0])
+			snprintf(buf, sizeof(buf), "%s %s", e->name, l.labels[k]);
 		else
 			snprintf(buf, sizeof(buf), "%s", e->name); // the unqualified parent set
 		free(e->unique);
 		e->unique = strdup(buf);
 	}
-	free(bufs);
-	free(labels);
-	free(filenames);
-	free(qualifiers);
+	ArcadeLabels_free(&l);
 	return ok;
 }
 
@@ -224,7 +179,7 @@ static Hash* aliasMapFor(AliasMaps* maps, const char* dir) {
 			return maps->maps[i].map;
 	char map_path[MAX_PATH];
 	snprintf(map_path, sizeof(map_path), "%s/map.txt", dir);
-	Hash* map = readMapFile(map_path);
+	Hash* map = EntryNames_readMap(map_path);
 	AliasMap* grown = realloc(maps->maps, (maps->count + 1) * sizeof(AliasMap));
 	if (!grown) {
 		if (map)
@@ -270,7 +225,7 @@ static void Directory_index(Directory* self) {
 	snprintf(map_path, sizeof(map_path), "%s/map.txt", map_dir);
 	// for a collection's games this is only the legacy Collections/map.txt (keyed by bare file name, which older
 	// builds' Rename Rom wrote): still honoured, after the game's own console map.txt
-	Hash* map = readMapFile(map_path);
+	Hash* map = EntryNames_readMap(map_path);
 	// Recents names come from the alias recorded at launch (a Rename or the
 	// arcade title it showed then); the arcade table must not override that.
 	bool use_arcade = !exactMatch(FAUX_RECENT_PATH, self->path);
@@ -307,7 +262,7 @@ static void Directory_index(Directory* self) {
 			if (hide(entry->name)) {
 				Entry_free(entry);
 			} else {
-				Array_push(entries, entry);
+				EntryArray_push(entries, entry);
 			}
 		}
 		Array_free(self->entries);
@@ -343,79 +298,14 @@ static void Directory_index(Directory* self) {
 			while (j < self->entries->count && exactMatch(entry->name, ((Entry*)self->entries->items[j])->name))
 				j++;
 
-			char first_tag[MAX_PATH];
-			getEmuName(entry->path, first_tag);
-			const char* first_file = baseName(entry->path);
-			bool same_file = true;
-			bool tags_differ = false;
-			for (int k = i + 1; k < j; k++) {
-				Entry* e = self->entries->items[k];
-				if (!exactMatch(baseName(e->path), first_file))
-					same_file = false;
-				char tag[MAX_PATH];
-				getEmuName(e->path, tag);
-				if (!exactMatch(tag, first_tag))
-					tags_differ = true;
-			}
-
-			// Prefer the extensionless stem for the "files differ" labels, but only
-			// if every stem in the run is still distinct; if two collide (e.g.
-			// "Tetris.gb" vs "Tetris.gbc") the run keeps full filenames. Runs are
-			// short, so an O(n^2) pairwise compare is fine.
-			bool stems_unique = false;
-			if (!same_file) {
-				stems_unique = true;
-				for (int k = i; k < j && stems_unique; k++) {
-					char stem_k[MAX_PATH];
-					getFileStem(((Entry*)self->entries->items[k])->path, stem_k);
-					for (int m = k + 1; m < j; m++) {
-						char stem_m[MAX_PATH];
-						getFileStem(((Entry*)self->entries->items[m])->path, stem_m);
-						if (exactMatch(stem_k, stem_m)) {
-							stems_unique = false;
-							break;
-						}
-					}
-				}
-			}
-
-			bool arcade_labelled = !same_file && !tags_differ && arcadeLabelRun(self, map, i, j);
-			for (int k = i; k < j && !arcade_labelled; k++) {
-				Entry* e = self->entries->items[k];
-				free(e->unique);
-				e->unique = NULL;
-				char buf[MAX_PATH] = {0};
-				if (same_file) {
-					getUniqueName(e, buf);
-				} else {
-					char stem[MAX_PATH];
-					getFileStem(e->path, stem);
-					const char* label = stems_unique ? stem : baseName(e->path);
-					if (tags_differ) {
-						char tag[MAX_PATH];
-						getEmuName(e->path, tag);
-						snprintf(buf, sizeof(buf), "%s (%s)", label, tag);
-					} else {
-						snprintf(buf, sizeof(buf), "%s", label);
-					}
-				}
-				e->unique = strdup(buf);
-			}
+			EntryNamesRun run = EntryNames_runInfo(self->entries, i, j);
+			bool arcade_labelled = !run.same_file && !run.tags_differ && arcadeLabelRun(self, map, i, j);
+			if (!arcade_labelled)
+				EntryNames_labelRun(self->entries, i, j, run);
 		}
 
-		if (!skip_index) {
-			int a = getIndexChar(entry->name);
-			if (a != alpha) {
-				// a list not in getIndexChar's order (a name changed after the sort) could start more groups than
-				// alphas holds: the overflow joins the last group rather than pointing past it
-				if (self->alphas.count < INT_ARRAY_MAX) {
-					index = self->alphas.count;
-					IntArray_push(&self->alphas, i);
-				}
-				alpha = a;
-			}
-			entry->alpha = index;
-		}
+		if (!skip_index)
+			entry->alpha = EntryNames_alphaStep(&self->alphas, &alpha, &index, i, entry->name);
 
 		prior = entry;
 	}
@@ -739,7 +629,21 @@ void Content_sourcesChanged(void) {
 	src_fp_valid = false;
 }
 
-#define CACHE_FP_PREFIX "#fp="
+#define CACHE_FP_PREFIX ENTRY_CACHE_FP_PREFIX
+
+// Doubles *cap until `need` more bytes (and a NUL) fit after len; false (the buffer freed) when out of memory.
+static bool cacheBufReserve(char** buf, size_t* cap, size_t len, size_t need) {
+	while (len + need + 1 > *cap) {
+		char* grown = realloc(*buf, *cap * 2);
+		if (!grown) {
+			free(*buf);
+			return false;
+		}
+		*buf = grown;
+		*cap *= 2;
+	}
+	return true;
+}
 
 // serialize entries as "path\tname\n" lines and stage via writeFileAtomic so a
 // power cut can never leave a truncated cache. Only the rom index uses it, and an empty one is written too (just the
@@ -754,72 +658,14 @@ static void writeEntryCache(const char* cache_path, Array* entries, uint64_t fp)
 	len += snprintf(buf, cap, CACHE_FP_PREFIX "%016" PRIx64 "\n", fp);
 	for (int i = 0; i < entries->count; i++) {
 		Entry* entry = entries->items[i];
-		size_t need = strlen(entry->path) + strlen(entry->name) + 2;
-		while (len + need + 1 > cap) {
-			cap *= 2;
-			char* grown = realloc(buf, cap);
-			if (!grown) {
-				free(buf);
-				return;
-			}
-			buf = grown;
-		}
+		if (!cacheBufReserve(&buf, &cap, len, strlen(entry->path) + strlen(entry->name) + 2))
+			return;
 		size_t row = len + strlen(entry->path) + 1;
 		len += snprintf(buf + len, cap - len, "%s\t%s\n", entry->path, entry->name);
 		Emulist_blankField(buf + row, strlen(entry->name)); // a tab or newline in a name would split the row
 	}
 	writeFileAtomic(cache_path, buf, len);
 	free(buf);
-}
-
-// Walks the "path\tname\n" lines writeEntryCache emits, calling cb(path, name, ctx) for each.
-// Returns the line count, or -1 when the cache is missing or malformed, or when expect_fp is set
-// and the recorded source fingerprint differs (stale, or a pre-fingerprint file). fp_out (may be
-// NULL) receives the recorded fingerprint, 0 when there is none.
-static int forEachEntryCacheLine(const char* cache_path, const uint64_t* expect_fp, uint64_t* fp_out,
-								 void (*cb)(char* path, char* name, void* ctx), void* ctx) {
-	if (fp_out)
-		*fp_out = 0;
-	FILE* file = fopen(cache_path, "r");
-	if (!file)
-		return -1;
-
-	int count = 0;
-	// sized to what writeEntryCache can emit (two MAX_PATH strings + tab + newline), plus the
-	// emulist's count column
-	char line[MAX_PATH * 2 + 24];
-	bool first = true;
-	while (fgets(line, sizeof(line), file) != NULL) {
-		normalizeNewline(line);
-		trimTrailingNewlines(line);
-		if (first) {
-			first = false;
-			uint64_t fp = 0;
-			bool has_fp = sscanf(line, CACHE_FP_PREFIX "%" SCNx64, &fp) == 1;
-			if (expect_fp && (!has_fp || fp != *expect_fp)) {
-				fclose(file);
-				return -1; // sources changed since this cache was written
-			}
-			if (has_fp) {
-				if (fp_out)
-					*fp_out = fp;
-				continue;
-			}
-		}
-		if (strlen(line) == 0)
-			continue;
-
-		char* tab = strchr(line, '\t');
-		if (!tab) {
-			fclose(file);
-			return -1; // malformed cache, force rescan
-		}
-		*tab = '\0';
-		cb(line, tab + 1, ctx);
-		count++;
-	}
-	fclose(file);
-	return count;
 }
 
 typedef struct {
@@ -829,7 +675,7 @@ typedef struct {
 
 static void readEntryCacheCb(char* path, char* name, void* ctx) {
 	EntryCacheRead* read = ctx;
-	Array_push(read->entries, Entry_newNamed(path, read->type, name));
+	EntryArray_push(read->entries, Entry_newNamed(path, read->type, name));
 }
 
 // Shared reader for the "path\tname\n" caches writeEntryCache emits. Returns
@@ -839,7 +685,7 @@ static void readEntryCacheCb(char* path, char* name, void* ctx) {
 // NULL expect_fp skips the check, for callers that just (re)built the file.
 static Array* readEntryCacheFile(const char* cache_path, int type, const uint64_t* expect_fp) {
 	EntryCacheRead read = {Array_new(), type};
-	int count = forEachEntryCacheLine(cache_path, expect_fp, NULL, readEntryCacheCb, &read);
+	int count = EntryCache_forEachLine(cache_path, expect_fp, NULL, readEntryCacheCb, &read);
 	if (count <= 0) { // missing/stale/malformed; an empty cache is never trusted either: force rescan
 		EntryArray_free(read.entries);
 		return NULL;
@@ -891,16 +737,8 @@ static void writeEmulistCache(Array* entries, const int* counts, uint64_t fp) {
 	len += snprintf(buf, cap, CACHE_FP_PREFIX "%016" PRIx64 "\n", fp);
 	for (int i = 0; i < entries->count; i++) {
 		Entry* entry = entries->items[i];
-		size_t need = strlen(entry->path) + strlen(entry->name) + 16;
-		while (len + need + 1 > cap) {
-			cap *= 2;
-			char* grown = realloc(buf, cap);
-			if (!grown) {
-				free(buf);
-				return;
-			}
-			buf = grown;
-		}
+		if (!cacheBufReserve(&buf, &cap, len, strlen(entry->path) + strlen(entry->name) + 16))
+			return;
 		len += Emulist_formatRow(entry->path, entry->name, counts[i], buf + len, cap - len);
 	}
 	writeFileAtomic(EMULIST_CACHE_PATH, buf, len);
@@ -918,7 +756,7 @@ static void readEmulistCb(char* path, char* name, void* ctx) {
 	EmulistRead* read = ctx;
 	if (read->bad)
 		return;
-	// forEachEntryCacheLine split at the first tab, so `name` is "name\tcount": rejoin and parse the row
+	// EntryCache_forEachLine split at the first tab, so `name` is "name\tcount": rejoin and parse the row
 	char line[MAX_PATH * 2 + 24];
 	char *row_path, *row_name;
 	int count;
@@ -938,14 +776,14 @@ static void readEmulistCb(char* path, char* name, void* ctx) {
 		read->cap = cap;
 	}
 	read->counts[read->entries->count] = count;
-	Array_push(read->entries, Entry_newNamed(row_path, ENTRY_DIR, row_name));
+	EntryArray_push(read->entries, Entry_newNamed(row_path, ENTRY_DIR, row_name));
 }
 
 // The emulist rows recorded against fp, or NULL (forcing a rescan) when the file is missing, stale,
 // empty, or has any row that isn't "path\tname\tcount".
 static Array* readEmulistCache(uint64_t fp, int** counts_out) {
 	EmulistRead read = {Array_new(), NULL, 0, false};
-	int rows = forEachEntryCacheLine(EMULIST_CACHE_PATH, &fp, NULL, readEmulistCb, &read);
+	int rows = EntryCache_forEachLine(EMULIST_CACHE_PATH, &fp, NULL, readEmulistCb, &read);
 	if (rows <= 0 || read.bad) {
 		EntryArray_free(read.entries);
 		free(read.counts);
@@ -1005,95 +843,10 @@ void Content_invalidateEmulist(void) {
 	dropEmulistMemo();
 }
 
-// The "#fp=" header of a cache file; false when the file is missing or has none.
-static bool readCacheFp(const char* cache_path, uint64_t* fp) {
-	FILE* file = fopen(cache_path, "r");
-	if (!file)
-		return false;
-	char line[64];
-	bool ok = fgets(line, sizeof(line), file) != NULL && sscanf(line, CACHE_FP_PREFIX "%" SCNx64, fp) == 1;
-	fclose(file);
-	return ok;
-}
-
 bool Content_romCachesFresh(void) {
 	uint64_t now = sourcesFingerprint(), index_fp = 0, emulist_fp = 0;
-	return now && readCacheFp(ROMINDEX_CACHE_PATH, &index_fp) && index_fp == now &&
-		   readCacheFp(EMULIST_CACHE_PATH, &emulist_fp) && emulist_fp == now;
-}
-
-typedef struct {
-	char* buf;
-	size_t len, cap;
-	const char* drop; // rows at or below this path are left out; NULL keeps all
-	size_t drop_len;
-	int kept, dropped;
-	// emulist rows ("name\tcount" after the first tab): lower each count by adjust_dropped when the row
-	// collates adjust_folder (Emulist_adjustCount); NULL copies rows through untouched
-	const char* adjust_folder;
-	int adjust_dropped;
-	bool failed;
-} CacheRewrite;
-
-static void rewriteCacheCb(char* path, char* name, void* ctx) {
-	CacheRewrite* rw = ctx;
-	if (rw->failed)
-		return;
-	if (rw->drop && strncmp(path, rw->drop, rw->drop_len) == 0 &&
-		(path[rw->drop_len] == '\0' || path[rw->drop_len] == '/')) {
-		rw->dropped++;
-		return;
-	}
-	char row[MAX_PATH * 2 + 24];
-	if (rw->adjust_folder) {
-		char* row_path;
-		char* row_name;
-		int count;
-		if ((size_t)snprintf(row, sizeof(row), "%s\t%s", path, name) >= sizeof(row) ||
-			!Emulist_parseRow(row, &row_path, &row_name, &count)) {
-			rw->failed = true; // not a counted row: let the caller invalidate rather than guess
-			return;
-		}
-		Emulist_adjustCount(row_path, rw->adjust_folder, rw->adjust_dropped, &count);
-		// re-emit as "path\tname\tcount": the copy below writes "path\t<name>"
-		char* tail = row_name + strlen(row_name);
-		snprintf(tail, sizeof(row) - (tail - row), "\t%d", count);
-		name = row_name;
-	}
-	size_t need = strlen(path) + strlen(name) + 2;
-	while (rw->len + need + 1 > rw->cap) {
-		char* grown = realloc(rw->buf, rw->cap * 2);
-		if (!grown) {
-			rw->failed = true;
-			return;
-		}
-		rw->buf = grown;
-		rw->cap *= 2;
-	}
-	rw->len += snprintf(rw->buf + rw->len, rw->cap - rw->len, "%s\t%s\n", path, name);
-	rw->kept++;
-}
-
-// Rewrite cache_path stamped with new_fp, leaving out the rows at or below `drop` (*dropped, may be NULL,
-// gets how many) and, with adjust_folder set, lowering emulist counts by adjust_dropped (CacheRewrite).
-// Returns the rows kept, or -1 (file untouched) when it can't be read or written; an empty result is not
-// written (see writeEntryCache).
-static int rewriteEntryCache(const char* cache_path, uint64_t new_fp, const char* drop, int* dropped,
-							 const char* adjust_folder, int adjust_dropped) {
-	CacheRewrite rw = {malloc(16384), 0, 16384, drop, drop ? strlen(drop) : 0, 0, 0, adjust_folder, adjust_dropped, false};
-	if (dropped)
-		*dropped = 0;
-	if (!rw.buf)
-		return -1;
-	rw.len = snprintf(rw.buf, rw.cap, CACHE_FP_PREFIX "%016" PRIx64 "\n", new_fp);
-	int rows = forEachEntryCacheLine(cache_path, NULL, NULL, rewriteCacheCb, &rw);
-	if (dropped)
-		*dropped = rw.dropped;
-	int kept = rw.kept;
-	if (rows < 0 || rw.failed || (kept > 0 && !writeFileAtomic(cache_path, rw.buf, rw.len)))
-		kept = -1;
-	free(rw.buf);
-	return kept;
+	return now && EntryCache_readFp(ROMINDEX_CACHE_PATH, &index_fp) && index_fp == now &&
+		   EntryCache_readFp(EMULIST_CACHE_PATH, &emulist_fp) && emulist_fp == now;
 }
 
 void Content_forgetRom(const char* removed_path, bool caches_were_fresh) {
@@ -1131,22 +884,12 @@ void Content_forgetRom(const char* removed_path, bool caches_were_fresh) {
 	char folder_path[MAX_PATH];
 	snprintf(folder_path, sizeof(folder_path), "%s/%s", ROMS_PATH, folder);
 	int dropped = 0;
-	if (!fp || rewriteEntryCache(ROMINDEX_CACHE_PATH, fp, removed_path, &dropped, NULL, 0) <= 0 ||
-		rewriteEntryCache(EMULIST_CACHE_PATH, fp, NULL, NULL, folder_path, dropped) <= 0) {
+	if (!fp || EntryCache_rewrite(ROMINDEX_CACHE_PATH, fp, removed_path, &dropped, NULL, 0) <= 0 ||
+		EntryCache_rewrite(EMULIST_CACHE_PATH, fp, NULL, NULL, folder_path, dropped) <= 0) {
 		Content_invalidateEmulist();
 		return;
 	}
 	dropEmulistMemo(); // the next read takes the restamped emulist against fp, kept (lib_gen moves on)
-}
-
-// Byte length of the rom-label part of an indexed name ("Zelda (GBA)" -> 5):
-// the offset of the LAST " (" (the tag suffix always starts there and tags
-// never contain parentheses), or the whole string when there is no " (".
-int Content_romLabelLen(const char* indexed_name) {
-	const char* last = NULL;
-	for (const char* p = strstr(indexed_name, " ("); p; p = strstr(p + 1, " ("))
-		last = p;
-	return last ? (int)(last - indexed_name) : (int)strlen(indexed_name);
 }
 
 Array* Content_searchRoms(const char* query) {
@@ -1180,7 +923,7 @@ Array* Content_searchRoms(const char* query) {
 		// match the label ("Metal Slug (Arcade)") or the raw filename ("mslug"),
 		// so an aliased rom still surfaces under its on-disk name
 		if (containsString(entry->name, (char*)query) || containsString((char*)baseName(entry->path), (char*)query)) {
-			Array_push(results, entry);
+			EntryArray_push(results, entry);
 		} else {
 			Entry_free(entry);
 		}
@@ -1212,32 +955,24 @@ static void labelArcadeIndexRows(ArcadeIndexRow* rows, int count, const char* ta
 		while (j < count && exactMatch(rows[i].title, rows[j].title))
 			j++;
 		int n = j - i;
-		if (n > 1) {
-			const char** qualifiers = calloc(n, sizeof(char*));
-			const char** filenames = calloc(n, sizeof(char*));
-			char** labels = calloc(n, sizeof(char*));
-			char* bufs = calloc(n, MAX_PATH);
-			bool ok = qualifiers && filenames && labels && bufs;
-			for (int k = 0; ok && k < n; k++) {
-				qualifiers[k] = rows[i + k].qualifier;
-				filenames[k] = baseName(rows[i + k].entry->path);
-				labels[k] = bufs + k * MAX_PATH;
+		ArcadeLabels l;
+		if (n > 1 && ArcadeLabels_alloc(&l, n)) {
+			for (int k = 0; k < n; k++) {
+				l.qualifiers[k] = rows[i + k].qualifier;
+				l.filenames[k] = baseName(rows[i + k].entry->path);
 			}
-			if (ok && ArcadeNames_disambiguate(qualifiers, filenames, n, labels, MAX_PATH)) {
+			if (ArcadeNames_disambiguate(l.qualifiers, l.filenames, n, l.labels, MAX_PATH)) {
 				for (int k = 0; k < n; k++) {
-					if (!labels[k][0])
+					if (!l.labels[k][0])
 						continue; // the unqualified parent set keeps "<title> (<tag>)"
 					Entry* e = rows[i + k].entry;
 					char name[MAX_PATH];
-					snprintf(name, sizeof(name), "%s %s (%s)", rows[i + k].title, labels[k], tag);
+					snprintf(name, sizeof(name), "%s %s (%s)", rows[i + k].title, l.labels[k], tag);
 					free(e->name);
 					e->name = strdup(name);
 				}
 			}
-			free(bufs);
-			free(labels);
-			free(filenames);
-			free(qualifiers);
+			ArcadeLabels_free(&l);
 		}
 		i = j;
 	}
@@ -1269,7 +1004,7 @@ static void indexRomDir(Array* rom_index, const char* dir_path) {
 	// per-console aliases: the same map.txt the folder view honours
 	char map_path[MAX_PATH];
 	snprintf(map_path, sizeof(map_path), "%s/map.txt", dir_path);
-	Hash* rom_map = readMapFile(map_path);
+	Hash* rom_map = EntryNames_readMap(map_path);
 
 	ArcadeIndexRow* arcade_rows = NULL;
 	int arcade_count = 0;
@@ -1316,7 +1051,8 @@ static void indexRomDir(Array* rom_index, const char* dir_path) {
 		snprintf(full_display, sizeof(full_display), "%s (%s)", rom_label, tag);
 
 		Entry* entry = Entry_newNamed(rom_path, ENTRY_ROM, full_display);
-		Array_push(rom_index, entry);
+		if (!EntryArray_push(rom_index, entry))
+			continue; // out of memory: the row is left out (and freed)
 
 		if (from_arcade) {
 			if (arcade_count == arcade_cap) {
@@ -1394,7 +1130,7 @@ static Array* scanRoms(uint64_t fp, int** counts_out) {
 			if (hasRoms(dp->d_name)) {
 				strncpy(tmp, dp->d_name, remaining - 1);
 				full_path[MAX_PATH - 1] = '\0';
-				Array_push(emus, Entry_new(full_path, ENTRY_DIR));
+				EntryArray_push(emus, Entry_new(full_path, ENTRY_DIR));
 			}
 		}
 		closedir(dh);
@@ -1408,11 +1144,11 @@ static Array* scanRoms(uint64_t fp, int** counts_out) {
 				// (MD) when Sega Genesis (GPGX) survived) are still scanned for
 				// the search index under the survivor's label, mirroring
 				// getEntries' collation
-				Array_push(sibling_dirs, entry);
+				EntryArray_push(sibling_dirs, entry);
 				continue;
 			}
-			Array_push(entries, entry);
-			prev_entry = entry;
+			if (EntryArray_push(entries, entry))
+				prev_entry = entry;
 		}
 		Array_free(emus);
 	}
@@ -1420,7 +1156,7 @@ static Array* scanRoms(uint64_t fp, int** counts_out) {
 	// Handle mapping logic
 	char map_path[MAX_PATH];
 	snprintf(map_path, sizeof(map_path), "%s/map.txt", ROMS_PATH);
-	Hash* map = entries->count > 0 ? readMapFile(map_path) : NULL;
+	Hash* map = entries->count > 0 ? EntryNames_readMap(map_path) : NULL;
 	if (map) {
 		bool resort = false;
 		for (int i = 0; i < entries->count; i++) {
@@ -1535,7 +1271,7 @@ static Array* getRoms(void) {
 	Array* entries = Array_new();
 	for (int i = 0; i < emu_memo->count; i++) {
 		Entry* entry = emu_memo->items[i];
-		Array_push(entries, Entry_newNamed(entry->path, entry->type, entry->name));
+		EntryArray_push(entries, Entry_newNamed(entry->path, entry->type, entry->name));
 	}
 	return entries;
 }
@@ -1590,7 +1326,7 @@ Array* getCollections(void) {
 				continue;
 			strncpy(tmp, dp->d_name, remaining - 1);
 			full_path[MAX_PATH - 1] = '\0';
-			Array_push(collections, Entry_new(full_path, ENTRY_DIR));
+			EntryArray_push(collections, Entry_new(full_path, ENTRY_DIR));
 		}
 		closedir(dh);
 		EntryArray_sort(collections);
@@ -1624,12 +1360,8 @@ static Array* getPinned(void) {
 				}
 			}
 
-			Entry* entry = Entry_new(sd_path, type);
-			if (name) {
-				free(entry->name);
-				entry->name = strdup(name);
-			}
-			Array_push(root, entry);
+			Entry* entry = name ? Entry_newNamed(sd_path, type, name) : Entry_new(sd_path, type);
+			EntryArray_push(root, entry);
 		}
 	}
 
@@ -1646,7 +1378,7 @@ static Array* getSimpleTools(void) {
 	if (!exists(settings_path))
 		snprintf(settings_path, sizeof(settings_path), "%s/Settings.pak", TOOLS_PATH);
 	if (exists(settings_path))
-		Array_push(entries, Entry_newNamed(settings_path, ENTRY_PAK, "Settings"));
+		EntryArray_push(entries, Entry_newNamed(settings_path, ENTRY_PAK, "Settings"));
 	return entries;
 }
 
@@ -1676,7 +1408,7 @@ int Content_forEachCollectionGame(const char* path, bool (*cb)(const char* sd_pa
 
 static bool getCollectionCb(const char* sd_path, void* ctx) {
 	int type = suffixMatch(".pak", sd_path) ? ENTRY_PAK : ENTRY_ROM;
-	Array_push((Array*)ctx, Entry_new(sd_path, type));
+	EntryArray_push((Array*)ctx, Entry_new(sd_path, type));
 	return true;
 }
 static Array* getCollection(char* path) {
@@ -1687,12 +1419,9 @@ static Array* getCollection(char* path) {
 
 static bool getDiscsCb(const char* disc_path, int index, void* ctx) {
 	Array* entries = (Array*)ctx;
-	Entry* entry = Entry_new(disc_path, ENTRY_ROM);
-	free(entry->name);
 	char name[16];
-	sprintf(name, "Disc %i", index + 1);
-	entry->name = strdup(name);
-	Array_push(entries, entry);
+	snprintf(name, sizeof(name), "Disc %i", index + 1);
+	EntryArray_push(entries, Entry_newNamed(disc_path, ENTRY_ROM, name));
 	return true;
 }
 static Array* getDiscs(char* path) {
@@ -1743,7 +1472,7 @@ static void addEntries(Array* entries, char* path) {
 					type = ENTRY_ROM;
 				}
 			}
-			Array_push(entries, Entry_new(full_path, type));
+			EntryArray_push(entries, Entry_new(full_path, type));
 		}
 		closedir(dh);
 	}
@@ -1815,7 +1544,7 @@ Array* getTools(void) {
 				continue;
 			char full_path[MAX_PATH];
 			snprintf(full_path, sizeof(full_path), "%s/%s", TOOLS_PATH, dp->d_name);
-			Array_push(entries, Entry_new(full_path, type));
+			EntryArray_push(entries, Entry_new(full_path, type));
 		}
 		closedir(sd);
 	}
@@ -1839,7 +1568,7 @@ Array* getTools(void) {
 				continue;
 			char full_path[MAX_PATH];
 			snprintf(full_path, sizeof(full_path), "%s/%s", plat_path, dp->d_name);
-			Array_push(entries, Entry_new(full_path, ENTRY_PAK));
+			EntryArray_push(entries, Entry_new(full_path, ENTRY_PAK));
 		}
 		closedir(pd);
 	}
@@ -1855,7 +1584,7 @@ Array* getTools(void) {
 				continue;
 			char full_path[MAX_PATH];
 			snprintf(full_path, sizeof(full_path), "%s/%s", sys_path, dp->d_name);
-			Array_push(entries, Entry_new(full_path, ENTRY_PAK));
+			EntryArray_push(entries, Entry_new(full_path, ENTRY_PAK));
 		}
 		closedir(dh);
 	}

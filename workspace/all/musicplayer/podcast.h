@@ -164,8 +164,6 @@ int Podcast_initPlayback(void);
 void Podcast_reloadPlaybackData(void);
 void Podcast_reloadProgress(void);
 
-// Cleanup resources
-void Podcast_cleanup(void);
 // Detach the catalog/download UI without stopping playback or writing owner progress.
 void Podcast_cleanupCatalog(void);
 
@@ -380,8 +378,14 @@ int Podcast_findFeedIndex(const char* feed_url);
 // RSS Parser (podcast_rss.c)
 // ============================================================================
 
-// Parse RSS feed (simple - just feed metadata)
-int podcast_rss_parse(const char* xml_data, int xml_len, PodcastFeed* feed);
+// True when xml holds a whole feed: its root element (<rss>, Atom <feed> or
+// RSS 1.0 <rdf:RDF>) is closed near the end. A cut-off download parses fine up
+// to the cut, and saving that parse would silently drop the older episodes.
+bool podcast_rss_is_complete(const char* xml_data, int xml_len);
+
+// Publication date of an RSS (RFC 822, weekday optional, any zone) or Atom
+// (ISO 8601) date as a UTC timestamp; 0 when it can't be read
+uint32_t podcast_rss_parse_date(const char* date_str);
 
 // Parse RSS feed with episodes output
 int podcast_rss_parse_with_episodes(const char* xml_data, int xml_len, PodcastFeed* feed,

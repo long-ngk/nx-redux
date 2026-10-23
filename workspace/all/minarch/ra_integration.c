@@ -1,5 +1,6 @@
 #include "ra_integration.h"
 #include "ra_consoles.h"
+#include "ra_helpers.h"
 #include "ra_hash_cdreader.h"
 #include "config.h"
 #include "http.h"
@@ -88,7 +89,7 @@ static bool ra_memory_regions_initialized = false;
 #define RA_MAX_PATH 512
 typedef struct {
 	char rom_path[RA_MAX_PATH];
-	uint8_t* rom_data;
+	const uint8_t* rom_data; // borrowed: game.data, see RA_forgetGameData
 	size_t rom_size;
 	char emu_tag[16];
 	char core_name[64];
@@ -167,20 +168,9 @@ static void ra_clear_muted_achievements(void);
 static void ra_reset_login_state(void);
 static void ra_start_login(void);
 static void RA_setAchievementMuted(uint32_t achievement_id, bool muted);
-static uint32_t ra_get_retry_delay_ms(int attempt);
 static void ra_login_callback(int result, const char* error_message, rc_client_t* client, void* userdata);
 static int ra_sync_thread_fn(void* data);
 static bool ra_try_sync(const char* reason);
-
-/*****************************************************************************
- * Helper: Get retry delay for login attempts
- *****************************************************************************/
-static uint32_t ra_get_retry_delay_ms(int attempt) {
-	// Delays: 1s, 2s, 4s, 8s, 8s
-	uint32_t delays[] = {1000, 2000, 4000, 8000, 8000};
-	int idx = (attempt < 5) ? attempt : 4;
-	return delays[idx];
-}
 
 /*****************************************************************************
  * Helper: Reset login retry state
@@ -381,13 +371,7 @@ static void ra_load_muted_achievements(void) {
 		return; // No mute file yet, that's okay
 	}
 
-	char line[32];
-	while (fgets(line, sizeof(line), f) && ra_muted_count < RA_MAX_MUTED_ACHIEVEMENTS) {
-		uint32_t id = (uint32_t)strtoul(line, NULL, 10);
-		if (id > 0) {
-			ra_muted_achievements[ra_muted_count++] = id;
-		}
-	}
+	ra_muted_count = RA_readMutedIds(f, ra_muted_achievements, RA_MAX_MUTED_ACHIEVEMENTS);
 
 	fclose(f);
 	RA_LOG_DEBUG("Loaded %d muted achievements for game %s\n", ra_muted_count, ra_game_hash);
@@ -482,15 +466,15 @@ static uint32_t ra_read_memory(uint32_t address, uint8_t* buffer, uint32_t num_b
 	void* mem_data = ra_get_memory_data(0);
 	size_t mem_size = ra_get_memory_size(0);
 
-	// note: written to avoid uint32 wrap in `address + num_bytes` — achievement
-	// definitions are server-supplied and can carry addresses near UINT32_MAX
-	if (!mem_data || address > mem_size || num_bytes > mem_size - address) {
+	// achievement definitions are server-supplied: RA_memRangeFits allows for
+	// addresses near UINT32_MAX
+	if (!mem_data || !RA_memRangeFits(mem_size, address, num_bytes)) {
 		// Try save RAM as fallback (some cores expose different memory types)
 		// RETRO_MEMORY_SAVE_RAM = 1
 		mem_data = ra_get_memory_data(1);
 		mem_size = ra_get_memory_size(1);
 
-		if (!mem_data || address > mem_size || num_bytes > mem_size - address) {
+		if (!mem_data || !RA_memRangeFits(mem_size, address, num_bytes)) {
 			return 0;
 		}
 	}
@@ -514,7 +498,7 @@ typedef struct {
 	rc_client_server_callback_t callback;
 	void* callback_data;
 	char* post_data_copy; // for response classification when caching
-	bool background;	  // process on a worker thread (see ra_is_background_request)
+	bool background;	  // process on a worker thread (see RA_isBackgroundRequest)
 } RA_ServerCallData;
 
 /*****************************************************************************
@@ -533,10 +517,6 @@ typedef struct {
 static SDL_mutex* ra_bg_mutex = NULL;
 static bool ra_bg_accepting = false; // false once RA_quit starts tearing down
 static int ra_bg_inflight = 0;
-
-static bool ra_is_background_request(const char* post_data) {
-	return post_data && strstr(post_data, "r=achievementsets") != NULL;
-}
 
 typedef struct {
 	rc_client_server_callback_t callback;
@@ -749,7 +729,7 @@ static void ra_server_call(const rc_api_request_t* request,
 		size_t body_len = 0;
 		int status = 0;
 		if (RA_Offline_handleRequest(request->post_data, &body, &body_len, &status)) {
-			if (ra_is_background_request(request->post_data))
+			if (RA_isBackgroundRequest(request->post_data))
 				ra_bg_spawn(body, body_len, status, callback, callback_data);
 			else
 				ra_queue_push(body, body_len, status, callback, callback_data);
@@ -790,7 +770,7 @@ static void ra_server_call(const rc_api_request_t* request,
 	data->callback = callback;
 	data->callback_data = callback_data;
 	data->post_data_copy = request->post_data ? strdup(request->post_data) : NULL;
-	data->background = ra_is_background_request(request->post_data);
+	data->background = RA_isBackgroundRequest(request->post_data);
 
 	// Make async HTTP request
 	if (request->post_data && strlen(request->post_data) > 0) {
@@ -1020,7 +1000,7 @@ static void ra_login_callback(int result, const char* error_message,
 			ra_fallback_to_offline();
 		} else if (ra_login_retry.count < RA_LOGIN_MAX_RETRIES) {
 			// Schedule retry
-			uint32_t delay = ra_get_retry_delay_ms(ra_login_retry.count);
+			uint32_t delay = RA_retryDelayMs(ra_login_retry.count);
 			ra_login_retry.next_time = SDL_GetTicks() + delay;
 			ra_login_retry.pending = true;
 			ra_login_retry.count++;
@@ -1476,10 +1456,7 @@ static void RA_initMemoryRegions(uint32_t console_id) {
  * Helper: Clear pending game data
  *****************************************************************************/
 static void ra_clear_pending_game(void) {
-	if (ra_pending_load.rom_data) {
-		free(ra_pending_load.rom_data);
-		ra_pending_load.rom_data = NULL;
-	}
+	ra_pending_load.rom_data = NULL;
 	ra_pending_load.rom_size = 0;
 	ra_pending_load.rom_path[0] = '\0';
 	ra_pending_load.emu_tag[0] = '\0';
@@ -1542,6 +1519,11 @@ static void ra_do_load_game(const char* rom_path, const uint8_t* rom_data, size_
 #endif
 }
 
+void RA_forgetGameData(void) {
+	ra_pending_load.rom_data = NULL;
+	ra_pending_load.rom_size = 0;
+}
+
 void RA_setRecordedRomPath(const char* path) {
 	snprintf(ra_record_rom_path, sizeof(ra_record_rom_path), "%s", path ? path : "");
 }
@@ -1558,9 +1540,8 @@ void RA_loadGame(const char* rom_path, const uint8_t* rom_data, size_t rom_size,
 
 	// If not logged in yet, store the game info for deferred loading
 	if (!ra_logged_in) {
-		// only defer (which copies the whole ROM) when a login can actually
-		// complete — same condition RA_init uses to start one. Otherwise the
-		// copy would sit in RAM for the entire session with no consumer.
+		// only defer when a login can actually complete — same condition
+		// RA_init uses to start one.
 		if (!(CFG_getRAAuthenticated() && strlen(CFG_getRAToken()) > 0)) {
 			RA_LOG_WARN("Not authenticated - skipping game load for: %s\n", rom_path);
 			return;
@@ -1580,16 +1561,11 @@ void RA_loadGame(const char* rom_path, const uint8_t* rom_data, size_t rom_size,
 		snprintf(ra_pending_load.core_name, sizeof(ra_pending_load.core_name), "%s",
 				 core_name ? core_name : "");
 
-		// Copy ROM data if provided (some cores need it)
+		// Borrow the ROM data (game.data) rather than copying the whole ROM:
+		// it lives until Game_close, which calls RA_forgetGameData first
 		if (rom_data && rom_size > 0) {
-			ra_pending_load.rom_data = (uint8_t*)malloc(rom_size);
-			if (ra_pending_load.rom_data) {
-				memcpy(ra_pending_load.rom_data, rom_data, rom_size);
-				ra_pending_load.rom_size = rom_size;
-			} else {
-				RA_LOG_WARN("Failed to allocate memory for pending ROM data\n");
-				ra_pending_load.rom_size = 0;
-			}
+			ra_pending_load.rom_data = rom_data;
+			ra_pending_load.rom_size = rom_size;
 		}
 
 		ra_pending_load.active = true;

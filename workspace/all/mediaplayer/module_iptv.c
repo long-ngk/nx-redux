@@ -7,6 +7,7 @@
 #include "module_iptv.h"
 #include "iptv.h"
 #include "iptv_curated.h"
+#include "iptv_text.h"
 #include "stream_probe.h"
 #include "wifi.h"
 #include "display_helper.h"
@@ -132,34 +133,6 @@ static bool jump_channel_initial(const CuratedTVChannel* channels, int dir) {
 	return true;
 }
 
-// Copy `name` into `out`, dropping any "[...]" tag segments (e.g. the
-// "[Geo-blocked]" / "[Not 24/7]" status tags iptv-org puts in channel names)
-// and collapsing the whitespace they leave behind. Used only for the saved
-// channel name; the browser list keeps the tags as a heads-up.
-static void strip_name_tags(const char* name, char* out, int out_sz) {
-	int j = 0, depth = 0;
-	for (int i = 0; name[i] && j < out_sz - 1; i++) {
-		char c = name[i];
-		if (c == '[') {
-			depth++;
-			continue;
-		}
-		if (c == ']') {
-			if (depth > 0)
-				depth--;
-			continue;
-		}
-		if (depth > 0)
-			continue;
-		if (c == ' ' && j > 0 && out[j - 1] == ' ')
-			continue; // collapse runs of spaces left by removed tags
-		out[j++] = c;
-	}
-	while (j > 0 && out[j - 1] == ' ')
-		j--; // trim trailing space
-	out[j] = '\0';
-}
-
 // Fetch (with a blocking "Loading…" overlay) the iptv-org country list.
 // Returns the loaded count, or -1 on failure.
 static int browse_load_countries(SDL_Surface* screen, IndicatorType show_setting, bool force) {
@@ -210,6 +183,11 @@ ModuleExitReason IPTVModule_run(SDL_Surface* screen) {
 		GFX_startFrame();
 		PAD_poll();
 
+		// SIGTERM/SIGINT (also caught in ModuleCommon_handleGlobalInput, but
+		// the confirm dialog below runs without it)
+		if (ModuleCommon_quitRequested())
+			return MODULE_EXIT_QUIT;
+
 		// Handle confirmation dialog
 		if (show_confirm) {
 			if (PAD_justPressed(BTN_A)) {
@@ -254,8 +232,8 @@ ModuleExitReason IPTVModule_run(SDL_Surface* screen) {
 		if (state == IPTV_STATE_CURATED_COUNTRIES) {
 			ContextMenuItem ctx_items[2];
 			int ctx_count = 0;
-			ModuleCommon_ctxAdd(ctx_items, &ctx_count, "Refresh List", IPTV_CTX_REFRESH);
-			ModuleCommon_ctxAdd(ctx_items, &ctx_count, "Quit App", CTX_ID_QUIT);
+			ContextMenu_addItem(ctx_items, &ctx_count, "Refresh List", IPTV_CTX_REFRESH);
+			ContextMenu_addItem(ctx_items, &ctx_count, "Quit App", CTX_ID_QUIT);
 
 			GlobalInputResult global = ModuleCommon_handleGlobalInput(screen, &show_setting, ctx_items, ctx_count);
 			if (global.should_quit)
@@ -321,7 +299,7 @@ ModuleExitReason IPTVModule_run(SDL_Surface* screen) {
 											  curated_toast_message, curated_toast_time);
 				GFX_flip(screen);
 				dirty = 0;
-				ModuleCommon_tickToast(curated_toast_message, curated_toast_time, &dirty);
+				UI_tickToast(curated_toast_message, curated_toast_time, &dirty);
 			} else {
 				UI_listViewTickIdle(v);
 				GFX_sync();
@@ -333,8 +311,8 @@ ModuleExitReason IPTVModule_run(SDL_Surface* screen) {
 		if (state == IPTV_STATE_CURATED_CHANNELS) {
 			ContextMenuItem ctx_items[2];
 			int ctx_count = 0;
-			ModuleCommon_ctxAdd(ctx_items, &ctx_count, "Refresh List", IPTV_CTX_REFRESH);
-			ModuleCommon_ctxAdd(ctx_items, &ctx_count, "Quit App", CTX_ID_QUIT);
+			ContextMenu_addItem(ctx_items, &ctx_count, "Refresh List", IPTV_CTX_REFRESH);
+			ContextMenu_addItem(ctx_items, &ctx_count, "Quit App", CTX_ID_QUIT);
 
 			GlobalInputResult global = ModuleCommon_handleGlobalInput(screen, &show_setting, ctx_items, ctx_count);
 			if (global.should_quit)
@@ -410,7 +388,7 @@ ModuleExitReason IPTVModule_run(SDL_Surface* screen) {
 				} else {
 					// Save without the browser's status tags (e.g. "[Geo-blocked]").
 					char clean_name[IPTV_MAX_NAME];
-					strip_name_tags(channel->name, clean_name, sizeof(clean_name));
+					IPTV_stripNameTags(channel->name, clean_name, sizeof(clean_name));
 					if (IPTV_addUserChannel(clean_name, channel->url, channel->category, channel->logo, channel->decryption_key) >= 0) {
 						// No toast on success: the [+] marker already shows the
 						// channel was added.
@@ -438,7 +416,7 @@ ModuleExitReason IPTVModule_run(SDL_Surface* screen) {
 				GFX_flip(screen);
 				dirty = 0;
 
-				ModuleCommon_tickToast(curated_toast_message, curated_toast_time, &dirty);
+				UI_tickToast(curated_toast_message, curated_toast_time, &dirty);
 			} else {
 				GFX_sync();
 			}
@@ -454,10 +432,10 @@ ModuleExitReason IPTVModule_run(SDL_Surface* screen) {
 		// remove the selected channel, quit.
 		ContextMenuItem ctx_items[3];
 		int ctx_count = 0;
-		ModuleCommon_ctxAdd(ctx_items, &ctx_count, "Browse Channels", IPTV_CTX_BROWSE);
+		ContextMenu_addItem(ctx_items, &ctx_count, "Browse Channels", IPTV_CTX_BROWSE);
 		if (user_count > 0 && v->selected >= 0 && v->selected < user_count)
-			ModuleCommon_ctxAdd(ctx_items, &ctx_count, "Remove Channel", IPTV_CTX_REMOVE);
-		ModuleCommon_ctxAdd(ctx_items, &ctx_count, "Quit App", CTX_ID_QUIT);
+			ContextMenu_addItem(ctx_items, &ctx_count, "Remove Channel", IPTV_CTX_REMOVE);
+		ContextMenu_addItem(ctx_items, &ctx_count, "Quit App", CTX_ID_QUIT);
 
 		GlobalInputResult global = ModuleCommon_handleGlobalInput(screen, &show_setting, ctx_items, ctx_count);
 		if (global.should_quit)
@@ -513,7 +491,6 @@ ModuleExitReason IPTVModule_run(SDL_Surface* screen) {
 
 				FfplayConfig config;
 				memset(&config, 0, sizeof(config));
-				config.source = FFPLAY_SOURCE_STREAM;
 				config.is_stream = true;
 				config.screen_width = screen->w;
 				strncpy(config.path, ch->url, sizeof(config.path) - 1);
@@ -523,6 +500,8 @@ ModuleExitReason IPTVModule_run(SDL_Surface* screen) {
 
 				ModuleCommon_setAutosleepDisabled(true);
 				int rc = FfplayEngine_play(&config);
+				// back in the channel list: auto-sleep applies again
+				ModuleCommon_setAutosleepDisabled(false);
 
 				// TG5050: display recovery creates a new screen surface
 				{
@@ -569,7 +548,7 @@ ModuleExitReason IPTVModule_run(SDL_Surface* screen) {
 			render_iptv_user_channels(screen, show_setting, user_toast_message, user_toast_time);
 			GFX_flip(screen);
 			dirty = 0;
-			ModuleCommon_tickToast(user_toast_message, user_toast_time, &dirty);
+			UI_tickToast(user_toast_message, user_toast_time, &dirty);
 		} else {
 			UI_listViewTickIdle(v);
 			GFX_sync();

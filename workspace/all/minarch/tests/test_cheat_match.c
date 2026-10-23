@@ -103,6 +103,99 @@ int main(void) {
 		CHECK(n == 1 && idx[0] == 1, "PSP retail serial preferred over homebrew ID");
 	}
 
+	// 11. a region-less ROM takes the full (USA) set, not a source-only "(Rumbles)"
+	//     pack (real database names; the Rumbles files hold 6/4/1 cheats)
+	{
+		const char* c[] = {"Contra III - The Alien Wars (USA) (Action Replay).cht",
+						   "Contra III - The Alien Wars (USA) (Game Genie).cht",
+						   "Contra III - The Alien Wars (USA).cht", "Contra Iii - The Alien Wars (Rumbles).cht"};
+		int n = CheatMatch_select("Contra III - The Alien Wars", "Contra III - The Alien Wars.sfc", c, 4, idx, 16);
+		CHECK(n == 3 && has(idx, n, 0) && has(idx, n, 1) && has(idx, n, 2), "region-less Contra III gets the (USA) set");
+		const char* sor[] = {"Streets Of Rage 2 (Rumbles).cht", "Streets of Rage 2 (USA) (Action Replay).cht",
+							 "Streets of Rage 2 (USA).cht"};
+		n = CheatMatch_select("Streets of Rage 2", "Streets of Rage 2.md", sor, 3, idx, 16);
+		CHECK(n == 2 && has(idx, n, 1) && has(idx, n, 2), "region-less Streets of Rage 2 gets the (USA) set");
+		const char* cz[] = {"Comix Zone (Europe) (En,Fr,De,Es).cht", "Comix Zone (Japan) (En,Ja).cht",
+							"Comix Zone (Rumbles).cht", "Comix Zone (USA) (GameGenie).cht", "Comix Zone (USA).cht",
+							"Comix Zone (Unknown) (Beta) (1995-04-04).cht"};
+		n = CheatMatch_select("Comix Zone", "Comix Zone.md", cz, 6, idx, 16);
+		CHECK(n == 2 && has(idx, n, 3) && has(idx, n, 4), "region-less Comix Zone gets the (USA) set");
+		// a ROM that names its region still gets that region, even over USA
+		n = CheatMatch_select("Comix Zone", "Comix Zone (Europe).md", cz, 6, idx, 16);
+		CHECK(n == 1 && idx[0] == 0, "(Europe) Comix Zone keeps the Europe file");
+		// only a Rumbles pack: it is still used
+		const char* only[] = {"Comix Zone (Rumbles).cht"};
+		n = CheatMatch_select("Comix Zone", "Comix Zone.md", only, 1, idx, 16);
+		CHECK(n == 1 && idx[0] == 0, "a lone Rumbles pack is still picked");
+	}
+
+	// 12. no region to go by: USA, then World, then Europe
+	{
+		const char* c[] = {"Tetris (Japan) (En).cht", "Tetris (World) (Rev 1).cht"};
+		int n = CheatMatch_select("Tetris", "Tetris.gb", c, 2, idx, 16);
+		CHECK(n == 1 && idx[0] == 1, "region-less Tetris picks World over Japan");
+		const char* psp[] = {"Lumines [EU] [ULES-00043].cht", "Lumines [US] [ULUS-10046].cht"};
+		n = CheatMatch_select("Lumines", "Lumines.iso", psp, 2, idx, 16);
+		CHECK(n == 1 && idx[0] == 1, "region-less PSP game picks [US] over [EU]");
+	}
+
+	// 13. names spelled differently in the database: letters and digits only,
+	//     and only when nothing matches exactly
+	{
+		const char* c[] = {"Soul Calibur.cht"};
+		int n = CheatMatch_select("Soulcalibur", "Soulcalibur.chd", c, 1, idx, 16);
+		CHECK(n == 1 && idx[0] == 0, "Soulcalibur finds Soul Calibur.cht");
+		const char* mvc[] = {"Marvel Vs. Capcom (Japanese).cht", "Marvel Vs. Capcom 2.cht", "Marvel Vs. Capcom.cht"};
+		n = CheatMatch_select("Marvel vs Capcom 2", "Marvel vs Capcom 2.chd", mvc, 3, idx, 16);
+		CHECK(n == 1 && idx[0] == 1, "Marvel vs Capcom 2 finds Marvel Vs. Capcom 2.cht, not the first game");
+		const char* both[] = {"Soul-Calibur.cht", "Soulcalibur.cht"};
+		n = CheatMatch_select("Soulcalibur", "Soulcalibur.chd", both, 2, idx, 16);
+		CHECK(n == 1 && idx[0] == 1, "an exact stem wins over a loose one");
+		const char* other[] = {"Tetris 2 (USA).cht"};
+		n = CheatMatch_select("Tetris", "Tetris.gb", other, 1, idx, 16);
+		CHECK(n == 0, "loose matching still tells Tetris from Tetris 2");
+		char loose[64];
+		CheatMatch_looseStem("Marvel Vs. Capcom 2 (USA) (GameShark).cht", loose, sizeof(loose));
+		CHECK(strcmp(loose, "marvelvscapcom2") == 0, "loose stem drops case, spaces, punctuation and tags");
+		CheatMatch_looseStem("Quake III - Arena", loose, sizeof(loose));
+		CHECK(strcmp(loose, "quakeiiiarena") == 0, "loose stem of a ROM display name");
+	}
+
+	// 14. one cheat folder per console, whichever core runs it
+	{
+		const char *first, *second;
+		CheatMatch_consoleFolders("MGBA", "/Roms/GBA/Game.gba", &first, &second);
+		CHECK(!strcmp(first, "GBA") && !second, "MGBA reads Cheats/GBA");
+		CheatMatch_consoleFolders("SUPA", NULL, &first, &second);
+		CHECK(!strcmp(first, "SFC") && !second, "SUPA reads Cheats/SFC");
+		CheatMatch_consoleFolders("PSX", NULL, &first, &second);
+		CHECK(!strcmp(first, "PS"), "PSX reads Cheats/PS");
+		CheatMatch_consoleFolders("DCX", NULL, &first, &second);
+		CHECK(!strcmp(first, "DC"), "DCX reads Cheats/DC");
+		CheatMatch_consoleFolders("GPGX", "/Roms/Sega Genesis (GPGX)/Comix Zone.md", &first, &second);
+		CHECK(!strcmp(first, "MD") && !second, "GPGX Mega Drive ROM reads Cheats/MD");
+		CheatMatch_consoleFolders("GPGX", "/Roms/x/Sonic.GG", &first, &second);
+		CHECK(!strcmp(first, "GG"), "GPGX Game Gear ROM reads Cheats/GG (extension case ignored)");
+		CheatMatch_consoleFolders("GPGX", "/Roms/x/Alex Kidd.sms", &first, &second);
+		CHECK(!strcmp(first, "SMS"), "GPGX Master System ROM reads Cheats/SMS");
+		CheatMatch_consoleFolders("GPGX", "/Roms/x/Flicky.sg", &first, &second);
+		CHECK(!strcmp(first, "SG1000"), "GPGX SG-1000 ROM reads Cheats/SG1000");
+		CheatMatch_consoleFolders("GPGX", "/Roms/x/Sonic CD.chd", &first, &second);
+		CHECK(!strcmp(first, "SEGACD"), "GPGX Sega CD disc reads Cheats/SEGACD");
+		CheatMatch_consoleFolders("GPGX", "/Roms/v1.gg/Game", &first, &second);
+		CHECK(!strcmp(first, "MD"), "a dot in a folder name is not the ROM's extension");
+		CheatMatch_consoleFolders("GPGX", NULL, &first, &second);
+		CHECK(!strcmp(first, "MD"), "GPGX with no ROM yet defaults to Cheats/MD");
+		CheatMatch_consoleFolders("GB", NULL, &first, &second);
+		CHECK(!strcmp(first, "GB") && second && !strcmp(second, "GBC"), "GB reads GB, then GBC");
+		CheatMatch_consoleFolders("GBC", NULL, &first, &second);
+		CHECK(!strcmp(first, "GBC") && second && !strcmp(second, "GB"), "GBC reads GBC, then GB");
+		CheatMatch_consoleFolders("SGB", NULL, &first, &second);
+		CHECK(!strcmp(first, "SGB") && !second, "Super Game Boy keeps its own folder");
+		CheatMatch_consoleFolders("FC", NULL, &first, &second);
+		CHECK(!strcmp(first, "FC") && !second, "any other tag reads its own folder");
+	}
+
 	printf(fails ? "\n%d FAILURE(S)\n" : "\nALL PASS\n", fails);
 	return fails ? 1 : 0;
 }

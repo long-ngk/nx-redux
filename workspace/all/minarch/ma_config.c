@@ -5,7 +5,7 @@
 #include "ma_options.h"
 #include "ma_rewind.h"
 #include "ma_cpu_profile.h"
-#include <dirent.h>
+#include "ma_config_value.h"
 
 char* onoff_labels[] = {
 	"Off",
@@ -286,6 +286,7 @@ static char* shscaletype_labels[] = {
 
 // LOCAL_BUTTON_COUNT/RETRO_BUTTON_COUNT and ButtonMapping live in ma_internal.h
 
+// clang-format off
 ButtonMapping default_button_mapping[] = { // used if pak.cfg doesn't exist or doesn't have bindings
 	{"Up", RETRO_DEVICE_ID_JOYPAD_UP, BTN_ID_DPAD_UP},
 	{"Down", RETRO_DEVICE_ID_JOYPAD_DOWN, BTN_ID_DPAD_DOWN},
@@ -323,6 +324,7 @@ ButtonMapping button_label_mapping[] = { // used to lookup the retro_id and loca
 	{"L3", RETRO_DEVICE_ID_JOYPAD_L3, BTN_ID_L3},
 	{"R3", RETRO_DEVICE_ID_JOYPAD_R3, BTN_ID_R3},
 	{NULL, 0, 0}};
+// clang-format on
 ButtonMapping core_button_mapping[RETRO_BUTTON_COUNT + 1] = {0};
 
 const char* device_button_names[LOCAL_BUTTON_COUNT] = {
@@ -377,9 +379,6 @@ static char* getScreenScalingDesc(void) {
 		return "Native uses integer scaling.\nAspect uses core reported aspect ratio.\nAspect screen uses screen aspect ratio\nFullscreen has non-square pixels.";
 	}
 }
-static int getScreenScalingCount(void) {
-	return GFX_supportsOverscan() ? 5 : 4;
-}
 
 
 struct Config config = {
@@ -392,7 +391,6 @@ struct Config config = {
 						 .desc = NULL, // will call getScreenScalingDesc()
 						 .default_value = 1,
 						 .value = 1,
-						 .count = 3, // will call getScreenScalingCount()
 						 .values = scaling_labels,
 						 .labels = scaling_labels,
 					 },
@@ -402,7 +400,6 @@ struct Config config = {
 						 .desc = "Resampling quality higher takes more CPU",
 						 .default_value = 2,
 						 .value = 2,
-						 .count = 4,
 						 .values = resample_labels,
 						 .labels = resample_labels,
 					 },
@@ -412,7 +409,6 @@ struct Config config = {
 						 .desc = "Makes your leds follow on screen colors",
 						 .default_value = 0,
 						 .value = 0,
-						 .count = 6,
 						 .values = ambient_labels,
 						 .labels = ambient_labels,
 					 },
@@ -422,7 +418,6 @@ struct Config config = {
 						 .desc = "Grid simulates an LCD grid.\nLine simulates CRT scanlines.\nEffects usually look best at native scaling.",
 						 .default_value = 0,
 						 .value = 0,
-						 .count = 3,
 						 .values = effect_labels,
 						 .labels = effect_labels,
 					 },
@@ -432,7 +427,6 @@ struct Config config = {
 						 .desc = "Choose a custom overlay png from the Overlays folder",
 						 .default_value = 0,
 						 .value = 0,
-						 .count = 1,
 						 .values = overlay_labels,
 						 .labels = overlay_labels,
 					 },
@@ -442,7 +436,6 @@ struct Config config = {
 						 .desc = "Offset X pixels",
 						 .default_value = 64,
 						 .value = 64,
-						 .count = 129,
 						 .values = offset_labels,
 						 .labels = offset_labels,
 					 },
@@ -452,7 +445,6 @@ struct Config config = {
 						 .desc = "Offset Y pixels",
 						 .default_value = 64,
 						 .value = 64,
-						 .count = 129,
 						 .values = offset_labels,
 						 .labels = offset_labels,
 					 },
@@ -463,7 +455,6 @@ struct Config config = {
 						 .desc = "LINEAR smooths lines, but works better when final image is at higher resolution, so either core that outputs higher resolution or upscaling with shaders",
 						 .default_value = 1,
 						 .value = 1,
-						 .count = 3,
 						 .values = sharpness_labels,
 						 .labels = sharpness_labels,
 					 },
@@ -473,7 +464,6 @@ struct Config config = {
 						 .desc = "Choose what should be used as a\nreference for the frame rate.\n\"Native\" uses the emulator frame rate,\n\"Screen\" uses the frame rate of the screen,\n\"Emulated\" follows the game's own timing\n(GPU cores).",
 						 .default_value = SYNC_SRC_AUTO,
 						 .value = SYNC_SRC_AUTO,
-						 .count = 4,
 						 .values = sync_ref_labels,
 						 .labels = sync_ref_labels,
 					 },
@@ -483,7 +473,6 @@ struct Config config = {
 						 .desc = "Over- or underclock the CPU to prioritize\npure performance or power savings.",
 						 .default_value = 3,
 						 .value = 3,
-						 .count = 4,
 						 .values = overclock_labels,
 						 .labels = overclock_labels,
 					 },
@@ -493,7 +482,6 @@ struct Config config = {
 						 .desc = "Show frames per second, cpu load,\nresolution, and scaler information.",
 						 .default_value = 0,
 						 .value = 0,
-						 .count = 2,
 						 .values = onoff_labels,
 						 .labels = onoff_labels,
 					 },
@@ -503,7 +491,6 @@ struct Config config = {
 						 .desc = "Fast forward will not exceed the\nselected speed (but may be less\ndepending on game and emulator).",
 						 .default_value = 3, // 4x
 						 .value = 3,		 // 4x
-						 .count = 8,
 						 .values = max_ff_labels,
 						 .labels = max_ff_labels,
 					 },
@@ -513,7 +500,6 @@ struct Config config = {
 						 .desc = "Play or mute audio when fast forwarding.",
 						 .default_value = 0,
 						 .value = 0,
-						 .count = 2,
 						 .values = onoff_labels,
 						 .labels = onoff_labels,
 					 },
@@ -523,7 +509,6 @@ struct Config config = {
 						 .desc = "Enable in-memory rewind buffer.\nMust set a shortcut to access rewind during gameplay.\nUses extra CPU and memory.",
 						 .default_value = MINARCH_DEFAULT_REWIND_ENABLE ? 1 : 0,
 						 .value = MINARCH_DEFAULT_REWIND_ENABLE ? 1 : 0,
-						 .count = 2,
 						 .values = rewind_enable_labels,
 						 .labels = rewind_enable_labels,
 					 },
@@ -533,7 +518,6 @@ struct Config config = {
 						 .desc = "Memory reserved for rewind snapshots.\nIncrease for longer rewind times.",
 						 .default_value = 3, // 64MB
 						 .value = 3,
-						 .count = 6,
 						 .values = rewind_buffer_labels,
 						 .labels = rewind_buffer_labels,
 					 },
@@ -543,7 +527,6 @@ struct Config config = {
 						 .desc = "Interval between rewind snapshots.\nShorter intervals improve smoothness during rewind,\nbut increase CPU and memory usage.",
 						 .default_value = 0, // 16ms
 						 .value = 0,
-						 .count = 12,
 						 .values = rewind_granularity_values,
 						 .labels = rewind_granularity_labels,
 					 },
@@ -553,7 +536,6 @@ struct Config config = {
 						 .desc = "Compress rewind snapshots to save memory at the cost of CPU.",
 						 .default_value = 1,
 						 .value = 1,
-						 .count = 2,
 						 .values = onoff_labels,
 						 .labels = onoff_labels,
 					 },
@@ -563,7 +545,6 @@ struct Config config = {
 						 .desc = "LZ4 acceleration used for rewind snapshots.\nLower values compress more but use more CPU.",
 						 .default_value = 1, // value 2
 						 .value = 1,
-						 .count = 5,
 						 .values = rewind_compression_accel_values,
 						 .labels = rewind_compression_accel_labels,
 					 },
@@ -573,7 +554,6 @@ struct Config config = {
 						 .desc = "Play or mute audio when rewinding.",
 						 .default_value = MINARCH_DEFAULT_REWIND_AUDIO ? 1 : 0,
 						 .value = MINARCH_DEFAULT_REWIND_AUDIO ? 1 : 0,
-						 .count = 2,
 						 .values = onoff_labels,
 						 .labels = onoff_labels,
 					 },
@@ -594,7 +574,6 @@ struct Config config = {
 								  .desc = "If shaders have extra settings they will show up in this settings menu",
 								  .default_value = 1,
 								  .value = 1,
-								  .count = 0,
 								  .values = NULL,
 								  .labels = NULL,
 							  },
@@ -604,7 +583,6 @@ struct Config config = {
 								  .desc = "Load a premade shaders/emulators config.\nTo try out a preset, exit the game without saving settings!",
 								  .default_value = 1,
 								  .value = 1,
-								  .count = 0,
 								  .values = NULL,
 								  .labels = NULL,
 							  },
@@ -614,7 +592,6 @@ struct Config config = {
 								  .desc = "Number of shaders 1 to 3",
 								  .default_value = 0,
 								  .value = 0,
-								  .count = 4,
 								  .values = nrofshaders_labels,
 								  .labels = nrofshaders_labels,
 							  },
@@ -625,7 +602,6 @@ struct Config config = {
 								  .desc = "Shader 1 program to run",
 								  .default_value = 1,
 								  .value = 1,
-								  .count = 0,
 								  .values = NULL,
 								  .labels = NULL,
 							  },
@@ -635,7 +611,6 @@ struct Config config = {
 								  .desc = "Method of upscaling, NEAREST or LINEAR",
 								  .default_value = 1,
 								  .value = 1,
-								  .count = 2,
 								  .values = shfilter_labels,
 								  .labels = shfilter_labels,
 							  },
@@ -645,7 +620,6 @@ struct Config config = {
 								  .desc = "This will choose resolution source to scale from",
 								  .default_value = 0,
 								  .value = 0,
-								  .count = 2,
 								  .values = shscaletype_labels,
 								  .labels = shscaletype_labels,
 							  },
@@ -655,7 +629,6 @@ struct Config config = {
 								  .desc = "This will choose resolution source to scale from",
 								  .default_value = 1,
 								  .value = 1,
-								  .count = 2,
 								  .values = shscaletype_labels,
 								  .labels = shscaletype_labels,
 							  },
@@ -665,7 +638,6 @@ struct Config config = {
 								  .desc = "This will scale images x times,\nscreen scales to screens resolution (can hit performance)",
 								  .default_value = 1,
 								  .value = 1,
-								  .count = 9,
 								  .values = shupscale_labels,
 								  .labels = shupscale_labels,
 							  },
@@ -675,7 +647,6 @@ struct Config config = {
 								  .desc = "Shader 2 program to run",
 								  .default_value = 0,
 								  .value = 0,
-								  .count = 0,
 								  .values = NULL,
 								  .labels = NULL,
 
@@ -686,7 +657,6 @@ struct Config config = {
 								  .desc = "Method of upscaling, NEAREST or LINEAR",
 								  .default_value = 0,
 								  .value = 0,
-								  .count = 2,
 								  .values = shfilter_labels,
 								  .labels = shfilter_labels,
 							  },
@@ -696,7 +666,6 @@ struct Config config = {
 								  .desc = "This will choose resolution source to scale from",
 								  .default_value = 0,
 								  .value = 0,
-								  .count = 2,
 								  .values = shscaletype_labels,
 								  .labels = shscaletype_labels,
 							  },
@@ -706,7 +675,6 @@ struct Config config = {
 								  .desc = "This will choose resolution source to scale from",
 								  .default_value = 1,
 								  .value = 1,
-								  .count = 2,
 								  .values = shscaletype_labels,
 								  .labels = shscaletype_labels,
 							  },
@@ -716,7 +684,6 @@ struct Config config = {
 								  .desc = "This will scale images x times,\nscreen scales to screens resolution (can hit performance)",
 								  .default_value = 0,
 								  .value = 0,
-								  .count = 9,
 								  .values = shupscale_labels,
 								  .labels = shupscale_labels,
 							  },
@@ -726,7 +693,6 @@ struct Config config = {
 								  .desc = "Shader 3 program to run",
 								  .default_value = 2,
 								  .value = 2,
-								  .count = 0,
 								  .values = NULL,
 								  .labels = NULL,
 
@@ -737,7 +703,6 @@ struct Config config = {
 								  .desc = "Method of upscaling, NEAREST or LINEAR",
 								  .default_value = 0,
 								  .value = 0,
-								  .count = 2,
 								  .values = shfilter_labels,
 								  .labels = shfilter_labels,
 							  },
@@ -747,7 +712,6 @@ struct Config config = {
 								  .desc = "This will choose resolution source to scale from",
 								  .default_value = 0,
 								  .value = 0,
-								  .count = 2,
 								  .values = shscaletype_labels,
 								  .labels = shscaletype_labels,
 							  },
@@ -757,7 +721,6 @@ struct Config config = {
 								  .desc = "This will choose resolution source to scale from",
 								  .default_value = 1,
 								  .value = 1,
-								  .count = 2,
 								  .values = shscaletype_labels,
 								  .labels = shscaletype_labels,
 							  },
@@ -767,7 +730,6 @@ struct Config config = {
 								  .desc = "This will scale images x times,\nscreen scales to screens resolution (can hit performance)",
 								  .default_value = 0,
 								  .value = 0,
-								  .count = 9,
 								  .values = shupscale_labels,
 								  .labels = shupscale_labels,
 							  },
@@ -782,36 +744,6 @@ struct Config config = {
 	.shortcuts = (ButtonMapping[]){SHORTCUT_LIST(SHORTCUT_MAPPING_){NULL}},
 #undef SHORTCUT_MAPPING_
 };
-static int Config_getValue(char* cfg, const char* key, char* out_value, int* lock) { // gets value from string
-	size_t key_len = strlen(key);
-	char* tmp = cfg;
-	while ((tmp = strstr(tmp, key))) {
-		// only accept matches anchored to the start of a line (optionally
-		// behind a `-` lock marker) and followed by " = " — a raw substring
-		// hit can land inside a longer key or an unrelated value
-		char* at = tmp;
-		tmp += key_len;
-		int locked = at > cfg && *(at - 1) == '-';
-		char* line_start = locked ? at - 1 : at;
-		if ((line_start == cfg || *(line_start - 1) == '\n') && !strncmp(tmp, " = ", 3)) {
-			if (lock != NULL && locked)
-				*lock = 1; // prefixed with a `-` means lock
-			break;		   // matched
-		}
-	};
-	if (!tmp)
-		return 0;
-	tmp += 3;
-
-	strncpy(out_value, tmp, 256);
-	out_value[256 - 1] = '\0';
-	tmp = strchr(out_value, '\n');
-	if (!tmp)
-		tmp = strchr(out_value, '\r');
-	if (tmp)
-		*tmp = '\0';
-	return 1;
-}
 
 
 void setOverclock(int i) {
@@ -977,98 +909,6 @@ void Config_syncFrontend(char* key, int value) {
 	}
 }
 
-char** list_files_in_folder(const char* folderPath, int* fileCount, const char* defaultElement, const char* extensionFilter) {
-	*fileCount = 0; // callers read this even when we return NULL
-
-	DIR* dir = opendir(folderPath);
-	if (!dir) {
-		perror("opendir");
-		return NULL;
-	}
-
-	struct dirent* entry;
-	struct stat fileStat;
-	char** fileList = NULL;
-
-	if (defaultElement) {
-		fileList = malloc(sizeof(char*) * 2);
-		fileList[0] = strdup(defaultElement);
-		fileList[1] = NULL;
-		(*fileCount)++;
-	}
-
-	while ((entry = readdir(dir)) != NULL) {
-		// skip all entries starting with ._ (hidden files on macOS)
-		if (entry->d_name[0] == '.' && entry->d_name[1] == '_')
-			continue;
-		// skip macOS .DS_Store files
-		if (strcmp(entry->d_name, ".DS_Store") == 0)
-			continue;
-
-		char fullPath[1024];
-		snprintf(fullPath, sizeof(fullPath), "%s/%s", folderPath, entry->d_name);
-
-		if (stat(fullPath, &fileStat) == 0 && S_ISREG(fileStat.st_mode)) {
-			if (extensionFilter) {
-				const char* ext = strrchr(entry->d_name, '.');
-				if (!ext || strcmp(ext, extensionFilter) != 0) {
-					continue;
-				}
-			}
-
-			char** temp = realloc(fileList, sizeof(char*) * (*fileCount + 1));
-			if (!temp) {
-				perror("realloc");
-				for (int i = 0; i < *fileCount; ++i) {
-					free(fileList[i]);
-				}
-				free(fileList);
-				closedir(dir);
-				return NULL;
-			}
-			fileList = temp;
-			fileList[*fileCount] = strdup(entry->d_name);
-			(*fileCount)++;
-		}
-	}
-
-	closedir(dir);
-
-	// Alphabetical sort
-	for (int i = 0; i < *fileCount - 1; ++i) {
-		for (int j = i + 1; j < *fileCount; ++j) {
-			if (strcmp(fileList[i], fileList[j]) > 0) {
-				char* temp = fileList[i];
-				fileList[i] = fileList[j];
-				fileList[j] = temp;
-			}
-		}
-	}
-
-	// NUll terminate the list
-	char** temp = realloc(fileList, sizeof(char*) * (*fileCount + 1));
-	if (!temp) {
-		perror("realloc");
-		for (int i = 0; i < *fileCount; ++i) {
-			free(fileList[i]);
-		}
-		free(fileList);
-		return NULL;
-	}
-	fileList = temp;
-	fileList[*fileCount] = NULL;
-
-	return fileList;
-}
-
-void free_file_list(char** list) {
-	if (!list)
-		return;
-	for (int i = 0; list[i]; i++)
-		free(list[i]);
-	free(list);
-}
-
 // CONFIG_WRITE_ALL/CONFIG_WRITE_GAME live in ma_internal.h
 void Config_getPath(char* filename, int override) {
 	// filename is a MAX_PATH buffer in every caller
@@ -1161,7 +1001,6 @@ void Config_init(void) {
 	char** preset_filelist = list_files_in_folder(shaders_folder, &preset_filecount, NULL, ".cfg");
 	config.shaders.options[SH_SHADERS_PRESET].values = preset_filelist;
 	config.shaders.options[SH_SHADERS_PRESET].labels = preset_filelist;
-	config.shaders.options[SH_SHADERS_PRESET].count = preset_filecount;
 
 	// populate shader options
 	// TODO: None option?
@@ -1173,15 +1012,12 @@ void Config_init(void) {
 
 	config.shaders.options[SH_SHADER1].values = filelist;
 	config.shaders.options[SH_SHADER1].labels = filelist;
-	config.shaders.options[SH_SHADER1].count = filecount;
 
 	config.shaders.options[SH_SHADER2].values = filelist;
 	config.shaders.options[SH_SHADER2].labels = filelist;
-	config.shaders.options[SH_SHADER2].count = filecount;
 
 	config.shaders.options[SH_SHADER3].values = filelist;
 	config.shaders.options[SH_SHADER3].labels = filelist;
-	config.shaders.options[SH_SHADER3].count = filecount;
 
 	char overlaypath[MAX_PATH];
 	snprintf(overlaypath, sizeof(overlaypath), "%s/Overlays/%s", SDCARD_PATH, core.tag);
@@ -1190,7 +1026,6 @@ void Config_init(void) {
 	if (overlaylist) {
 		config.frontend.options[FE_OPT_OVERLAY].labels = overlaylist;
 		config.frontend.options[FE_OPT_OVERLAY].values = overlaylist;
-		config.frontend.options[FE_OPT_OVERLAY].count = filecount;
 	}
 	config.initialized = 1;
 }
@@ -1215,7 +1050,10 @@ void Config_readOptionsString(char* cfg) {
 	}
 
 	if (has_custom_controllers && Config_getValue(cfg, "minarch_gamepad_type", value, NULL)) {
-		gamepad_type = strtol(value, NULL, 0);
+		// An index into gamepad_values[] from a user-editable file: clamp it
+		int type = strtol(value, NULL, 0);
+		int type_count = (int)(sizeof(gamepad_labels) / sizeof(gamepad_labels[0])) - 1; // minus the NULL
+		gamepad_type = (type >= 0 && type < type_count) ? type : 0;
 		int device = strtol(gamepad_values[gamepad_type], NULL, 0);
 		core.set_controller_port_device(0, device);
 		core.set_controller_port_device(1, device); // player 2 (netplay) gets the same pad
@@ -1235,7 +1073,7 @@ void Config_readOptionsString(char* cfg) {
 	// Per-pak left stick as D-pad (ma_input.h)
 	if (Config_getValue(cfg, "minarch_stick_dpad", value, NULL))
 		input_stick_dpad = strcmp(value, "off") != 0;
-	for (int i = 0; config.core.options[i].key; i++) {
+	for (int i = 0; config.core.options && config.core.options[i].key; i++) { // NULL: core has no options
 		Option* option = &config.core.options[i];
 		if (!Config_getValue(cfg, option->key, value, &option->lock))
 			continue;
@@ -1300,7 +1138,6 @@ void Config_load(void) {
 	// update for crop overscan support
 	Option* scaling_option = &config.frontend.options[FE_OPT_SCALING];
 	scaling_option->desc = getScreenScalingDesc();
-	scaling_option->count = getScreenScalingCount();
 	if (!GFX_supportsOverscan()) {
 		scaling_labels[4] = NULL;
 	}
@@ -1456,9 +1293,7 @@ void Config_readControls(void) {
 	Config_readShortcuts();
 }
 static void writeOption(FILE* file, Option* option) {
-	int count = 0;
-	while (option->values && option->values[count])
-		count++;
+	int count = Option_valueCount(option);
 	int value = Config_netplayPadUserValue(option); // a forced netplay pad saves the user's own choice
 	if (value >= 0 && value < count) {
 		fprintf(file, "%s = %s\n", option->key, option->values[value]);
@@ -1482,7 +1317,7 @@ void Config_write(int override) {
 	for (int i = 0; config.frontend.options[i].key; i++) {
 		writeOption(file, &config.frontend.options[i]);
 	}
-	for (int i = 0; config.core.options[i].key; i++) {
+	for (int i = 0; config.core.options && config.core.options[i].key; i++) { // NULL: core has no options
 		writeOption(file, &config.core.options[i]);
 	}
 	for (int i = 0; config.shaders.options[i].key; i++) {
@@ -1525,7 +1360,7 @@ void Config_restore(void) {
 		option->value = option->default_value;
 		Config_syncFrontend(option->key, option->value);
 	}
-	for (int i = 0; config.core.options[i].key; i++) {
+	for (int i = 0; config.core.options && config.core.options[i].key; i++) { // NULL: core has no options
 		Option* option = &config.core.options[i];
 		option->value = option->default_value;
 	}

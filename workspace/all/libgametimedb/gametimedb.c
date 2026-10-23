@@ -5,6 +5,7 @@
 #include <sys/stat.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 #include <defines.h>
@@ -50,6 +51,10 @@ sqlite3* play_activity_db_open(void) {
 		play_activity_db_close(game_log_db);
 		return NULL;
 	}
+	// gametimectl runs overlap (stop_all in the background while the next
+	// launch starts its row): wait for the other writer instead of failing
+	// with SQLITE_BUSY and silently dropping the write
+	sqlite3_busy_timeout(game_log_db, 2000);
 
 	if (!db_exists) {
 		sqlite3_exec(game_log_db,
@@ -97,12 +102,6 @@ void get_rom_image_path(char* rom_file, char* out_image_path) {
 		ROM_mediaArtPath(rom_abs, out_image_path, STR_MAX - 1);
 		ROM_artExists(out_image_path, STR_MAX - 1);
 	}
-}
-
-int play_activity_db_transaction(sqlite3* game_log_db, int (*exec_transaction)(sqlite3*)) {
-	int retval;
-	retval = exec_transaction(game_log_db);
-	return retval;
 }
 
 int play_activity_db_execute(char* sql) {
@@ -192,8 +191,11 @@ PlayActivities* play_activity_find_all(void) {
 		entry->last_played_at = NULL;
 
 		rom->id = sqlite3_column_int(stmt, 0);
-		rom->type = strdup((const char*)sqlite3_column_text(stmt, 1));
-		rom->name = strdup((const char*)sqlite3_column_text(stmt, 2));
+		// rows imported from other trackers or edited by hand can hold NULLs
+		const char* type = (const char*)sqlite3_column_text(stmt, 1);
+		const char* name = (const char*)sqlite3_column_text(stmt, 2);
+		rom->type = strdup(type ? type : "");
+		rom->name = strdup(name ? name : "");
 		if (sqlite3_column_text(stmt, 3) != NULL) {
 			rom->file_path = strdup((const char*)sqlite3_column_text(stmt, 3));
 			rom->image_path = malloc(STR_MAX * sizeof(char));
@@ -220,18 +222,20 @@ PlayActivities* play_activity_find_all(void) {
 	return play_activities;
 }
 
+// rel_path must be MAX_PATH bytes; a longer result is cut to fit (rom_path
+// comes from gametimectl's command line and is not length-checked)
 void __ensure_rel_path(char* rel_path, const char* rom_path) {
 	if (!pathRelativeTo(rel_path, ROMS_PATH, rom_path)) {
 		if (strstr(rom_path, "../../Roms/") != NULL) {
 			char* dup = strdup((const char*)rom_path);
-			strcpy(rel_path, splitString(dup, "../../Roms/"));
+			snprintf(rel_path, MAX_PATH, "%s", splitString(dup, "../../Roms/"));
 			free(dup);
 		} else {
 			char* dup = strdup((const char*)rom_path);
 			char roms_path_slash[MAX_PATH];
 			snprintf(roms_path_slash, sizeof(roms_path_slash), "%s/", ROMS_PATH);
 			char* replaced = replaceString2(dup, roms_path_slash, "");
-			strcpy(rel_path, replaced);
+			snprintf(rel_path, MAX_PATH, "%s", replaced ? replaced : rom_path);
 			free(replaced);
 			free(dup);
 		}
@@ -340,21 +344,19 @@ int play_activity_transaction_rom_find_by_file_path(const char* rom_path, bool c
 	return retval;
 }
 
+// rom_path_out must be MAX_PATH bytes
 bool _get_active_rom_path(char* rom_path_out) {
-	char cmd[STR_MAX];
-	getFile(CMD_TO_RUN, cmd, STR_MAX);
-	trimTrailingNewlines(cmd);
-
 	// The ROM is the last single-quoted word of the launch command; parse it
 	// like the shell does so an escaped apostrophe ('\'') in the title comes
-	// back as a plain ' instead of truncating the path (see next_cmd.h).
-	return NextCmd_lastWord(cmd, rom_path_out, STR_MAX) == 1;
+	// back as a plain ' instead of truncating the path (see next_cmd.h). The
+	// command is read whole: it can be far longer than STR_MAX.
+	return NextCmd_readRomPath(CMD_TO_RUN, rom_path_out, MAX_PATH) == 1;
 }
 
 int __db_get_active_closed_activity(sqlite3* game_log_db) {
 	int rom_id = ROM_NOT_FOUND;
 
-	char rom_path[STR_MAX];
+	char rom_path[MAX_PATH];
 	if (!_get_active_rom_path(rom_path)) {
 		return ROM_NOT_FOUND;
 	}
@@ -380,12 +382,17 @@ int __db_get_active_closed_activity(sqlite3* game_log_db) {
 bool play_activity_is_excluded(const char* rom_file_path) {
 	if (!rom_file_path)
 		return false;
+	// the suffix is checked on the whole path: one longer than MAX_PATH still
+	// ends in portmaster.sh (the lowercased copy below is cut)
+	size_t len = strlen(rom_file_path);
+	if (len >= 13 && strcasecmp(rom_file_path + len - 13, "portmaster.sh") == 0)
+		return true;
 	char lower[MAX_PATH];
 	size_t n = 0;
 	for (; rom_file_path[n] && n < sizeof(lower) - 1; n++)
 		lower[n] = (char)tolower((unsigned char)rom_file_path[n]);
 	lower[n] = '\0';
-	return (n >= 13 && strcmp(lower + n - 13, "portmaster.sh") == 0) || strstr(lower, "portmaster.pak") != NULL;
+	return strstr(lower, "portmaster.pak") != NULL;
 }
 
 void play_activity_start(char* rom_file_path) {
@@ -402,7 +409,7 @@ void play_activity_start(char* rom_file_path) {
 
 void play_activity_resume(void) {
 	sqlite3* game_log_db = play_activity_db_open();
-	int rom_id = play_activity_db_transaction(game_log_db, __db_get_active_closed_activity);
+	int rom_id = __db_get_active_closed_activity(game_log_db);
 	play_activity_db_close(game_log_db);
 	if (rom_id == ROM_NOT_FOUND) {
 		printf("Error: no active rom\n");

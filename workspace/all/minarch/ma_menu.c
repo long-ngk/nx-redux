@@ -91,6 +91,15 @@ static bool menuDiscCb(const char* disc_path, int index, void* ctx) {
 	return true;
 }
 
+// Point menu.disc at the disc that is actually running. Called after every
+// Game_changeDisc (success or not) so the disc markers written by the next
+// save name the loaded disc.
+static void Menu_syncDiscIndex(void) {
+	int idx = SavePaths_discIndex(menu.disc_paths, menu.total_discs, game.path);
+	if (idx >= 0)
+		menu.disc = idx;
+}
+
 static void initFrontendVersionDesc(void);
 
 void Menu_init(void) {
@@ -581,6 +590,17 @@ static int OptionAchievements_openMenu(MenuList* list, int i) {
 	// Create flattened array of all achievement pointers
 	const rc_client_achievement_t** all_achievements = calloc(total_achievements, sizeof(rc_client_achievement_t*));
 	AchSortEntry* sort_entries = calloc(total_achievements, sizeof(AchSortEntry));
+	// Allocate filtered array once (max size = all achievements)
+	const rc_client_achievement_t** filtered = calloc(total_achievements, sizeof(rc_client_achievement_t*));
+	if (!all_achievements || !sort_entries || !filtered) {
+		free(all_achievements);
+		free(sort_entries);
+		free(filtered);
+		RA_destroyAchievementList(ach_menu_list);
+		ach_menu_list = NULL;
+		Menu_message("Failed to load achievements", (char*[]){"B", "BACK", NULL});
+		return MENU_CALLBACK_NOP;
+	}
 	int idx = 0;
 	uint32_t subset = 0;
 	for (uint32_t b = 0; b < ach_menu_list->num_buckets && idx < total_achievements; b++) {
@@ -608,8 +628,6 @@ static int OptionAchievements_openMenu(MenuList* list, int i) {
 	int start = 0;
 	int max_visible = (screen->h - ((SCALE1(PADDING + PILL_SIZE) * 2) + SCALE1(BUTTON_SIZE))) / SCALE1(BUTTON_SIZE);
 
-	// Allocate filtered array once (max size = all achievements)
-	const rc_client_achievement_t** filtered = calloc(total_achievements, sizeof(rc_client_achievement_t*));
 	int filtered_count = 0;
 
 	// Hide the "Unknown Emulator" warning when hardcore mode is disabled.
@@ -1009,48 +1027,6 @@ static void getArcadeTitle(const char* path, char* name) {
 		snprintf(name, MAX_PATH, "%s", cached_title);
 }
 
-// alias must be at least MAX_PATH bytes
-bool getAlias(char* path, char* alias) {
-	bool is_alias = false;
-	char* tmp;
-	char map_path[MAX_PATH + 8]; // room to swap the filename for "map.txt"
-	snprintf(map_path, sizeof(map_path), "%s", path);
-	tmp = strrchr(map_path, '/');
-	if (tmp) {
-		tmp += 1;
-		strcpy(tmp, "map.txt");
-	}
-	char* file_name = strrchr(path, '/');
-	if (file_name)
-		file_name += 1;
-
-	if (exists(map_path)) {
-		FILE* file = fopen(map_path, "r");
-		if (file) {
-			char line[256];
-			while (fgets(line, 256, file) != NULL) {
-				normalizeNewline(line);
-				trimTrailingNewlines(line);
-				if (strlen(line) == 0)
-					continue; // skip empty lines
-
-				tmp = strchr(line, '\t');
-				if (tmp) {
-					tmp[0] = '\0';
-					char* key = line;
-					char* value = tmp + 1;
-					if (exactMatch(file_name, key)) {
-						snprintf(alias, MAX_PATH, "%s", value);
-						is_alias = true;
-						break;
-					}
-				}
-			}
-			fclose(file);
-		}
-	}
-	return is_alias;
-}
 
 int Menu_options(MenuList* list) {
 	MenuItem* items = list->items;
@@ -1366,36 +1342,53 @@ int save_screenshot_thread(void* data) {
 	return 0;
 }
 SDL_Thread* screenshotsavethread;
-// GL-captures the current frame and returns it as a converted SDL_Surface
+// Hands `pixels` or `surface` (ownership passes here) to the PNG-save worker
+// after any previous save finishes. Without memory for the hand-off the image
+// is dropped; without a thread it is saved inline.
+static void Menu_startImageSave(unsigned char* pixels, SDL_Surface* surface, int w, int h, const char* png_path) {
+	SaveImageArgs* args = malloc(sizeof(SaveImageArgs));
+	char* path = SDL_strdup(png_path);
+	if (!args || !path) {
+		SDL_Log("Out of memory saving %s", png_path);
+		free(args);
+		free(path);
+		free(pixels);
+		SDL_FreeSurface(surface);
+		return;
+	}
+	args->pixels = pixels;
+	args->surface = surface;
+	args->w = w;
+	args->h = h;
+	args->path = path;
+	Menu_waitScreenshotSave();
+	screenshotsavethread = SDL_CreateThread(save_screenshot_thread, "SaveScreenshotThread", args);
+	if (!screenshotsavethread)
+		save_screenshot_thread(args); // frees args
+}
+// GL-captures the current frame, without notifications, and returns it as a converted SDL_Surface
 // (caller owns and must SDL_FreeSurface it), or NULL on capture failure.
 SDL_Surface* Menu_captureScreenSurface(Uint32 pixel_format) {
 	Present_stop();
 	int cw, ch;
-	unsigned char* pixels = GFX_GL_screenCapture(&cw, &ch);
+	unsigned char* pixels = GFX_GL_screenCaptureClean(&cw, &ch); // no toasts baked into the picture
 	if (!pixels)
 		return NULL;
 	SDL_Surface* converted = rawCaptureToSurface(pixels, cw, ch, pixel_format);
 	free(pixels);
 	return converted;
 }
-// GL-captures the current frame and hands it to the background PNG-save
+// GL-captures the current frame, without notifications, and hands it to the background PNG-save
 // worker at `png_path`; waits for any previous save to finish first.
 void Menu_queueScreenshotSave(const char* png_path) {
 	Present_stop();
 	int cw, ch;
-	unsigned char* pixels = GFX_GL_screenCapture(&cw, &ch);
+	unsigned char* pixels = GFX_GL_screenCaptureClean(&cw, &ch);
 	if (!pixels) {
 		SDL_Log("Failed to capture screenshot");
 		return;
 	}
-	SaveImageArgs* args = malloc(sizeof(SaveImageArgs));
-	args->pixels = pixels;
-	args->surface = NULL;
-	args->w = cw;
-	args->h = ch;
-	args->path = SDL_strdup(png_path);
-	Menu_waitScreenshotSave();
-	screenshotsavethread = SDL_CreateThread(save_screenshot_thread, "SaveScreenshotThread", args);
+	Menu_startImageSave(pixels, NULL, cw, ch, png_path);
 }
 // Hands a copy of `surface` to the background PNG-save worker at `png_path`.
 // The in-game menu runs at a capped CPU clock, and a shader's scanlines or
@@ -1407,14 +1400,7 @@ static void Menu_queueSurfaceSave(SDL_Surface* surface, const char* png_path) {
 		SDL_Log("Failed to copy screenshot surface: %s", SDL_GetError());
 		return;
 	}
-	SaveImageArgs* args = malloc(sizeof(SaveImageArgs));
-	args->pixels = NULL;
-	args->surface = copy;
-	args->w = copy->w;
-	args->h = copy->h;
-	args->path = SDL_strdup(png_path);
-	Menu_waitScreenshotSave();
-	screenshotsavethread = SDL_CreateThread(save_screenshot_thread, "SaveScreenshotThread", args);
+	Menu_startImageSave(NULL, copy, copy->w, copy->h, png_path);
 }
 // Blocks until a queued PNG save has finished writing, so its file can be read.
 void Menu_waitScreenshotSave(void) {
@@ -1539,7 +1525,9 @@ void Menu_loadState(void) {
 
 			char* disc_path = menu.disc_paths[menu.disc];
 			if (!exactMatch(slot_disc_path, disc_path)) {
-				if (!Game_changeDisc(slot_disc_path)) {
+				int changed = Game_changeDisc(slot_disc_path);
+				Menu_syncDiscIndex();
+				if (!changed) {
 					// wrong disc and no way to swap it - loading the state
 					// anyway would silently mix disc and save
 					Notification_push(NOTIFICATION_LOAD_STATE, "Load Failed - Wrong Disc", NULL);
@@ -1653,16 +1641,7 @@ static bool Menu_leaveNetplay(void) {
 	return UI_modalLoop(&opts) != 0;
 }
 
-void Menu_progressNotice(const char* title, const char* detail) {
-	Present_stop();
-	if (screen->w != DEVICE_WIDTH || screen->h != DEVICE_HEIGHT)
-		screen = GFX_resize(DEVICE_WIDTH, DEVICE_HEIGHT, DEVICE_PITCH);
-	GFX_clearShaders();
-	UI_renderConfirmDialogHints(screen, title, detail, (char*[]){NULL});
-	GFX_flip(screen);
-}
-
-void Menu_netplayNotice(const char* title, const char* subtitle, int hold_ms) {
+void Menu_notice(const char* title, const char* subtitle, int hold_ms) {
 	Present_stop();
 	if (screen->w != DEVICE_WIDTH || screen->h != DEVICE_HEIGHT)
 		screen = GFX_resize(DEVICE_WIDTH, DEVICE_HEIGHT, DEVICE_PITCH);
@@ -1829,6 +1808,7 @@ void Menu_loop(void) {
 				if (menu.total_discs && menu.disc >= 0 && rom_disc != menu.disc) {
 					char* disc_path = menu.disc_paths[menu.disc];
 					Game_changeDisc(disc_path);
+					Menu_syncDiscIndex();
 				}
 				show_menu = 0;
 				break;

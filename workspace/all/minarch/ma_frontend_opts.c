@@ -100,29 +100,19 @@ int OptionFrontend_openMenu(MenuList* list, int i) {
 	return MENU_CALLBACK_NOP;
 }
 
-// case-insensitive strstr; strcasestr is GNU-only and would need _GNU_SOURCE
-// ahead of every include in this TU
-static int containsCI(const char* haystack, const char* needle) {
-	if (!haystack)
-		return 0;
-	size_t nlen = strlen(needle);
-	for (; *haystack; haystack++) {
-		if (strncasecmp(haystack, needle, nlen) == 0)
-			return 1;
-	}
-	return 0;
-}
-
 // The libretro options API has no restart-required flag; every shipped core
 // that has restart-only options marks them with "restart" or "reload" in the
 // label or info text (audited against workspace/*/cores/src). Options that
 // can't take effect while a game is running stay in the pre-launch editor
 // (options.elf) and are hidden from the in-game menu.
 static int Option_requiresRestart(Option* option) {
-	static const char* words[] = {"restart", "reload", NULL};
+	static char* words[] = {"restart", "reload", NULL};
+	char* texts[] = {option->name, option->desc, option->full};
 	for (int i = 0; words[i]; i++) {
-		if (containsCI(option->name, words[i]) || containsCI(option->desc, words[i]) || containsCI(option->full, words[i]))
-			return 1;
+		for (int j = 0; j < 3; j++) {
+			if (texts[j] && containsString(texts[j], words[i]))
+				return 1;
+		}
 	}
 	return 0;
 }
@@ -189,6 +179,10 @@ int OptionEmulator_openMenu(MenuList* list, int index) {
 
 	int enabled_count = 0;
 	config.core.enabled_options = calloc(config.core.count + 1, sizeof(Option*));
+	if (!config.core.enabled_options) {
+		Menu_message("Out of memory.", (char*[]){"B", "BACK", NULL});
+		return MENU_CALLBACK_NOP;
+	}
 	for (int i = 0; i < config.core.count; i++) {
 		Option* item = &config.core.options[i];
 
@@ -206,7 +200,6 @@ int OptionEmulator_openMenu(MenuList* list, int index) {
 		config.core.enabled_options[enabled_count++] = item;
 	}
 	config.core.enabled_count = enabled_count;
-	config.core.enabled_options = realloc(config.core.enabled_options, sizeof(Option*) * (enabled_count + 1));
 
 	// If we are at the top level, add the categories — but only those with at
 	// least one visible option, since the restart filter can empty one out
@@ -218,7 +211,7 @@ int OptionEmulator_openMenu(MenuList* list, int index) {
 		while (config.core.categories[total].key)
 			total++;
 		cats = calloc(total + 1, sizeof(OptionCategory*));
-		for (int c = 0; c < total; c++) {
+		for (int c = 0; cats && c < total; c++) {
 			OptionCategory* cat = &config.core.categories[c];
 			for (int i = 0; i < config.core.count; i++) {
 				Option* item = &config.core.options[i];
@@ -231,6 +224,10 @@ int OptionEmulator_openMenu(MenuList* list, int index) {
 	}
 
 	OptionEmulator_menu.items = calloc(cat_count + config.core.enabled_count + 1, sizeof(MenuItem));
+	if (!OptionEmulator_menu.items) {
+		cat_count = 0;
+		config.core.enabled_count = 0;
+	}
 
 	for (int i = 0; i < cat_count; i++) {
 		OptionCategory* cat = cats[i];
@@ -252,6 +249,8 @@ int OptionEmulator_openMenu(MenuList* list, int index) {
 
 	if (cat_count || config.core.enabled_count) {
 		Menu_options(&OptionEmulator_menu);
+	} else if (!OptionEmulator_menu.items) {
+		Menu_message("Out of memory.", (char*[]){"B", "BACK", NULL});
 	} else {
 		if (list->category) {
 			Menu_message("This category has no options.", (char*[]){"B", "BACK", NULL});
@@ -552,20 +551,24 @@ int OptionCheats_openMenu(MenuList* list, int i) {
 	if (OptionCheats_menu.items == NULL) {
 		// populate
 		OptionCheats_menu.items = calloc(cheatcodes.count + 1, sizeof(MenuItem));
+		if (!OptionCheats_menu.items) {
+			Menu_message("Out of memory.", (char*[]){"B", "BACK", NULL});
+			return MENU_CALLBACK_NOP;
+		}
 		for (int i = 0; i < cheatcodes.count; i++) {
 			struct Cheat* cheat = &cheatcodes.cheats[i];
 			MenuItem* item = &OptionCheats_menu.items[i];
 
-			// this stuff gets actually copied around.. what year is it?
-			int len = strlen(cheat->name) + 1;
-			item->name = calloc(len, sizeof(char));
-			strcpy(item->name, cheat->name);
+			// the menu wraps desc in place, so both are copies; a failed
+			// copy of a name ends the list there
+			item->name = strdup(cheat->name);
+			if (!item->name)
+				break;
 
 			if (cheat->info) {
-				len = strlen(cheat->info) + 1;
-				item->desc = calloc(len, sizeof(char));
-				strncpy(item->desc, cheat->info, len);
-				GFX_wrapText(font.tiny, item->desc, DEVICE_WIDTH - SCALE1(2 * PADDING), 2);
+				item->desc = strdup(cheat->info);
+				if (item->desc)
+					GFX_wrapText(font.tiny, item->desc, DEVICE_WIDTH - SCALE1(2 * PADDING), 2);
 			}
 
 			item->value = cheat->enabled;
@@ -670,6 +673,10 @@ static int OptionPragmas_openMenu(MenuList* list, int i) {
 		totalcount += config.shaderpragmas[y].count;
 	}
 	PragmasOptions_menu.items = calloc(totalcount + 1, sizeof(MenuItem));
+	if (!PragmasOptions_menu.items) {
+		Menu_message("Out of memory.", (char*[]){"B", "BACK", NULL});
+		return MENU_CALLBACK_NOP;
+	}
 	// fill bound must match the allocation loop above — SH_NROFSHADERS is an
 	// enum index (2), not the shader count, and using it both overflowed the
 	// allocation and dropped shader 3's settings
@@ -772,7 +779,6 @@ int OptionShaders_openMenu(MenuList* list, int i) {
 	for (int i = SH_SHADER1; i < config.shaders.count; i += SH_SHADER2 - SH_SHADER1) {
 		config.shaders.options[i].values = filelist;
 		config.shaders.options[i].labels = filelist;
-		config.shaders.options[i].count = filecount;
 	}
 	ShaderOptions_menu.items = calloc(config.shaders.count + 1, sizeof(MenuItem));
 	fillShaderItems(ShaderOptions_menu.items);

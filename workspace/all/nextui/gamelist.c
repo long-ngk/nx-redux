@@ -18,6 +18,7 @@
 #include "ui_loadingoverlay.h"
 #include "ui_message.h"
 #include "ui_contextmenu.h"
+#include "ui_contextmenu_add.h"
 #include "ui_keyboard.h"
 #include "ui_accent.h"
 #include "ui_list.h"
@@ -31,12 +32,14 @@
 #include "contentdim.h"
 #include "collname.h"
 #include "romkey.h"
+#include "line_rewrite.h"
 #include "content.h"
 #include "gameswitcher.h"
 #include "imgloader.h"
 #include "artbg.h"
 #include "gameinfo.h"
 #include "gameinfo_text.h"
+#include "gamelist_text.h"
 #include "gridview.h"
 #include "minview.h"
 #include "rowview.h"
@@ -164,7 +167,7 @@ static bool prefetchListArt(Uint32 deadline) {
 	bool busy = false;
 	for (int d = 1; d <= LIST_ART_AHEAD; d++) {
 		for (int sign = 1; sign >= -1; sign -= 2) {
-			int i = ((sel + sign * d) % n + n) % n; // the List wraps
+			int i = MenuTabs_wrap(n, sel, sign * d); // the List wraps
 			Entry* e = top->entries->items[i];
 			const char* slash = strrchr(e->path, '/');
 			const char* pad_id = Pad_idForFolder(slash ? slash + 1 : e->path);
@@ -198,7 +201,7 @@ static bool prefetchListInfo(void) {
 	GameInfo info;
 	for (int d = 1; d <= LIST_INFO_AHEAD; d++) {
 		for (int sign = 1; sign >= -1; sign -= 2) {
-			Entry* e = list->entries->items[((sel + sign * d) % n + n) % n]; // the List wraps
+			Entry* e = list->entries->items[MenuTabs_wrap(n, sel, sign * d)]; // the List wraps
 			if (e->type == ENTRY_ROM && !GameInfo_prefetch(e->path, &info))
 				return true; // asked (or on its way): the next idle slot asks for the one after
 		}
@@ -229,7 +232,7 @@ static bool prefetchListPictures(void) {
 	int n = list->entries->count, sel = list->selected;
 	for (int d = 1; d <= LIST_PIC_AHEAD; d++) {
 		for (int sign = 1; sign >= -1; sign -= 2) {
-			int i = ((sel + sign * d) % n + n) % n; // the List wraps
+			int i = MenuTabs_wrap(n, sel, sign * d); // the List wraps
 			Entry* e = list->entries->items[i];
 			if (e->type != ENTRY_ROM)
 				continue;
@@ -485,37 +488,10 @@ static bool entryHasArt(const char* path) {
 	return exists(p);
 }
 
-// True when `path` is the folder-named .cue/.m3u of its parent dir (basename
-// minus extension == parent dir name) — the file that makes the parent a
-// folder game. Fills parent_out (>= MAX_PATH) with the parent dir path.
+// True when `path` is the folder-named .cue/.m3u of its parent dir (GameListText_folderGameParent) — the file
+// that makes the parent a folder game. Fills parent_out (>= MAX_PATH) with the parent dir path.
 static bool isFolderGameFile(const char* path, char* parent_out) {
-	if (!suffixMatch(".cue", path) && !suffixMatch(".m3u", path))
-		return false;
-	if (!prefixMatch(ROMS_PATH, path))
-		return false;
-	char work[MAX_PATH];
-	strncpy(work, path, sizeof(work) - 1);
-	work[sizeof(work) - 1] = '\0';
-	char* slash = strrchr(work, '/');
-	if (!slash)
-		return false;
-	char base[MAX_PATH];
-	strncpy(base, slash + 1, sizeof(base) - 1);
-	base[sizeof(base) - 1] = '\0';
-	char* dot = strrchr(base, '.');
-	if (dot)
-		*dot = '\0';
-	*slash = '\0'; // work = parent dir
-	// never treat a console dir as the "game folder" — a stray playlist named
-	// after the console (eg. DC/DC.m3u) must not delete the whole library
-	if (isConsoleDir(work))
-		return false;
-	char* parent_name = strrchr(work, '/');
-	if (!parent_name || !exactMatch(parent_name + 1, base))
-		return false;
-	strncpy(parent_out, work, MAX_PATH - 1);
-	parent_out[MAX_PATH - 1] = '\0';
-	return true;
+	return GameListText_folderGameParent(path, ROMS_PATH, parent_out, MAX_PATH);
 }
 
 // Depth-first recursive delete. Symlink-safe: lstat, so symlinks are
@@ -544,12 +520,66 @@ static void removeRecursive(const char* path) {
 	rmdir(path);
 }
 
+// Line rewrite shared by the collection and map.txt edits below. The whole
+// file is read (no line-length limit), filtered in memory (LineRewrite_filter)
+// and replaced with writeFileAtomic (tmp + fsync + rename), so a full card or a
+// power cut never leaves it empty or cut short, and the original stays on any
+// failure. A missing file reads as empty. Returns 1 if the file was rewritten,
+// 0 if nothing changed, -1 on a read or write error.
+static int rewriteMatchingLines(const char* path, const char* key, bool map_key, const char* replacement, bool append_if_absent) {
+	char* data = NULL;
+	size_t data_len = 0;
+	FILE* in = fopen(path, "rb");
+	if (in) {
+		size_t cap = 0;
+		char chunk[4096];
+		size_t n;
+		while ((n = fread(chunk, 1, sizeof(chunk), in)) > 0) {
+			if (data_len + n > cap) {
+				size_t ncap = cap ? cap * 2 : 8192;
+				char* grown = realloc(data, ncap);
+				if (!grown) {
+					free(data);
+					fclose(in);
+					return -1;
+				}
+				data = grown;
+				cap = ncap;
+			}
+			memcpy(data + data_len, chunk, n);
+			data_len += n;
+		}
+		bool read_failed = ferror(in) != 0;
+		fclose(in);
+		if (read_failed) {
+			free(data);
+			return -1;
+		}
+	} else if (!append_if_absent)
+		return 0; // nothing to prune
+
+	size_t out_len = 0;
+	bool changed = false;
+	char* out = LineRewrite_filter(data ? data : "", data_len, key, map_key, replacement, append_if_absent, &out_len, &changed);
+	free(data);
+	if (!out)
+		return -1;
+	int r = 0;
+	if (changed) {
+		r = writeFileAtomic(path, out, out_len) ? 1 : -1;
+		if (r < 0)
+			LOG_error("rewrite %s failed, original kept\n", path);
+	}
+	free(out);
+	return r;
+}
+
 // Prune one line across every Collections/*.txt. Lines that exactly match
 // old_rel (an SD-relative path in the on-disk format addRomToCollectionFile
 // writes: leading '/', no SDCARD_PATH prefix) are dropped. Only files that
-// actually change are rewritten, via a .tmp + rename so a crash mid-write
-// can't truncate a collection. Used on delete — a missing path would make
-// the game silently drop out (getCollection filters missing paths).
+// actually change are rewritten, atomically (rewriteMatchingLines). Used on
+// delete — a missing path would make the game silently drop out
+// (getCollection filters missing paths).
 static void removeCollectionLines(const char* old_rel) {
 	DIR* d = opendir(COLLECTIONS_PATH);
 	if (!d)
@@ -560,124 +590,33 @@ static void removeCollectionLines(const char* old_rel) {
 			continue;
 		char coll_path[MAX_PATH];
 		snprintf(coll_path, sizeof(coll_path), "%s/%s", COLLECTIONS_PATH, dp->d_name);
-
-		FILE* in = fopen(coll_path, "r");
-		if (!in)
-			continue;
-		char tmp_path[MAX_PATH];
-		snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", coll_path);
-		FILE* out = fopen(tmp_path, "w");
-		if (!out) {
-			fclose(in);
-			continue;
-		}
-
-		bool changed = false;
-		char line[MAX_PATH];
-		while (fgets(line, sizeof(line), in) != NULL) {
-			char trimmed[MAX_PATH];
-			strncpy(trimmed, line, sizeof(trimmed) - 1);
-			trimmed[sizeof(trimmed) - 1] = '\0';
-			normalizeNewline(trimmed);
-			trimTrailingNewlines(trimmed);
-			if (exactMatch(trimmed, old_rel)) {
-				changed = true; // drop the line
-			} else {
-				fputs(line, out); // preserve the original line verbatim
-			}
-		}
-		fclose(in);
-		fclose(out);
-
-		if (changed) {
-			rename(tmp_path, coll_path);
+		if (rewriteMatchingLines(coll_path, old_rel, false, NULL, false) == 1)
 			CollCount_invalidate(coll_path); // its count and cached stamps are stale
-		} else
-			unlink(tmp_path);
 	}
 	closedir(d);
 }
 
 // Upsert a display alias into a map.txt: rewrite `key`'s value to `value`, or
-// append the pair if absent. Atomic via .tmp + rename. Used when renaming an
-// aliased entry — the alias IS the shown name, so we edit it instead of the
-// file. No-op only if the parent dir is unwritable (fopen of .tmp fails).
-static void setMapAlias(const char* map_path, const char* key, const char* value) {
-	char tmp_path[MAX_PATH];
-	snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", map_path);
-	FILE* out = fopen(tmp_path, "w");
-	if (!out)
-		return;
-
-	bool replaced = false;
-	FILE* in = fopen(map_path, "r");
-	if (in) {
-		char line[MAX_PATH];
-		while (fgets(line, sizeof(line), in) != NULL) {
-			char work[MAX_PATH];
-			strncpy(work, line, sizeof(work) - 1);
-			work[sizeof(work) - 1] = '\0';
-			normalizeNewline(work);
-			trimTrailingNewlines(work);
-			char* tab = strchr(work, '\t');
-			if (tab) {
-				*tab = '\0';
-				if (exactMatch(work, key)) {
-					fprintf(out, "%s\t%s\n", key, value);
-					replaced = true;
-					continue;
-				}
-			}
-			fputs(line, out);
-		}
-		fclose(in);
-	}
-	if (!replaced)
-		fprintf(out, "%s\t%s\n", key, value);
-	fclose(out);
-	rename(tmp_path, map_path);
+// append the pair if absent. Atomic (rewriteMatchingLines). Used when renaming
+// an aliased entry — the alias IS the shown name, so we edit it instead of the
+// file. Returns false when the map could not be written (unwritable dir, full
+// card); the old map.txt is then left as it was.
+static bool setMapAlias(const char* map_path, const char* key, const char* value) {
+	size_t len = strlen(key) + strlen(value) + 3;
+	char* pair = malloc(len);
+	if (!pair)
+		return false;
+	snprintf(pair, len, "%s\t%s\n", key, value);
+	int r = rewriteMatchingLines(map_path, key, true, pair, true);
+	free(pair);
+	return r == 1;
 }
 
 // Remove a basename-keyed alias line from a map.txt (key<TAB>alias). Used on
 // delete so a later file that reuses the name doesn't inherit the dead entry's
 // alias. No-op if the file or the key is absent.
 static void dropMapKey(const char* map_path, const char* key) {
-	FILE* in = fopen(map_path, "r");
-	if (!in)
-		return;
-	char tmp_path[MAX_PATH];
-	snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", map_path);
-	FILE* out = fopen(tmp_path, "w");
-	if (!out) {
-		fclose(in);
-		return;
-	}
-
-	bool changed = false;
-	char line[MAX_PATH];
-	while (fgets(line, sizeof(line), in) != NULL) {
-		char work[MAX_PATH];
-		strncpy(work, line, sizeof(work) - 1);
-		work[sizeof(work) - 1] = '\0';
-		normalizeNewline(work);
-		trimTrailingNewlines(work);
-		char* tab = strchr(work, '\t');
-		if (tab) {
-			*tab = '\0';
-			if (exactMatch(work, key)) {
-				changed = true;
-				continue; // drop the aliased line
-			}
-		}
-		fputs(line, out);
-	}
-	fclose(in);
-	fclose(out);
-
-	if (changed)
-		rename(tmp_path, map_path);
-	else
-		unlink(tmp_path);
+	rewriteMatchingLines(map_path, key, true, NULL, false);
 }
 
 // Full-screen blocking confirm dialog. Returns true on A, false on B.
@@ -748,14 +687,7 @@ static int pickCollectionModal_handle(void* vctx) {
 
 // Copy a name into a dialog row, cut short on a UTF-8 character boundary (never half a character), terminated.
 static void copyRowText(char* dst, size_t size, const char* src) {
-	size_t n = strlen(src);
-	if (n >= size) {
-		n = size - 1;
-		while (n > 0 && ((unsigned char)src[n] & 0xC0) == 0x80)
-			n--; // src[n] continues the character before it: leave that character out
-	}
-	memcpy(dst, src, n);
-	dst[n] = '\0';
+	GameListText_copyRow(dst, size, src);
 }
 
 // Full-screen blocking collection picker. Returns the chosen collection index
@@ -873,7 +805,11 @@ static bool doRename(Entry* entry, int sel) {
 	char alias_dir[MAX_PATH], alias_key[MAX_PATH], home_map[MAX_PATH];
 	RomKey_aliasSource(entry->path, ROMS_PATH, alias_dir, sizeof(alias_dir), alias_key, sizeof(alias_key));
 	snprintf(home_map, sizeof(home_map), "%s/map.txt", alias_dir);
-	setMapAlias(home_map, alias_key, newname);
+	if (!setMapAlias(home_map, alias_key, newname)) {
+		// full or read-only card: map.txt is untouched, so the old name stays
+		free(newname);
+		return false;
+	}
 
 	// Older builds also wrote the name to Collections/map.txt, keyed by the bare file name (the folder game's cue/m3u):
 	// collections still honour such an entry when the console map.txt has none, so it goes, or it could outlive
@@ -924,11 +860,7 @@ static bool isCollectionRow(Entry* entry) {
 
 // A collection's name: its file name without ".txt".
 static void collectionStem(const char* path, char* out /* MAX_PATH */) {
-	const char* slash = strrchr(path, '/');
-	snprintf(out, MAX_PATH, "%s", slash ? slash + 1 : path);
-	size_t n = strlen(out);
-	if (n > 4 && suffixMatch(".txt", out))
-		out[n - 4] = '\0';
+	GameListText_collectionStem(path, out, MAX_PATH);
 }
 
 // A one-button notice (A or B closes it).
@@ -1335,26 +1267,15 @@ static void artFetchPoll(unsigned long now, bool* dirty) {
 // Fit a game name onto one line of the modal title (font.large), ellipsizing
 // when it's wider than the modal (the loading overlay assumes a single-line
 // title, so an unbounded name would wrap into the subtitle). UTF-8 aware.
-static void artFetchTitle(const char* name, char* out, size_t out_size) {
-	int maxw = screen->w - SCALE1(PADDING * 6);
-	snprintf(out, out_size, "%s", name);
+static int artFetchMeasure(void* ctx, const char* utf8) {
+	(void)ctx;
 	int w = 0;
-	GFX_measureText(font.large, out, &w, NULL);
-	if (w <= maxw)
-		return;
-	size_t len = strlen(out);
-	while (len > 0) {
-		len--;
-		while (len > 0 && ((unsigned char)out[len] & 0xC0) == 0x80)
-			len--; // don't split a UTF-8 sequence
-		char cand[256];
-		snprintf(cand, sizeof(cand), "%.*s...", (int)len, name);
-		GFX_measureText(font.large, cand, &w, NULL);
-		if (w <= maxw) {
-			snprintf(out, out_size, "%s", cand);
-			return;
-		}
-	}
+	GFX_measureText(font.large, utf8, &w, NULL);
+	return w;
+}
+
+static void artFetchTitle(const char* name, char* out, size_t out_size) {
+	GameListText_fitTitle(name, out, out_size, screen->w - SCALE1(PADDING * 6), artFetchMeasure, NULL);
 }
 
 typedef struct {
@@ -1516,6 +1437,7 @@ static void ctxRefresh(int root_sel) {
 	// the marker probes and the List's art are per path: a pak or art added on the card since must show
 	netplay_cap_path[0] = '\0';
 	emuopts_cap_path[0] = '\0';
+	launchopts_cap_path[0] = '\0';
 	listArtForget();
 	thumbCacheForgetMisses();
 	HomeArt_forgetAll();
@@ -1871,11 +1793,7 @@ void GameList_openTab(MenuTabId id, bool* dirty) {
 // Context-menu items
 
 static void addItem(ContextMenuItem* items, int* idx, const char* label, int id) {
-	if (*idx >= CONTEXTMENU_MAX_ITEMS)
-		return;
-	snprintf(items[*idx].label, CONTEXTMENU_MAX_TEXT, "%s", label);
-	items[*idx].id = id;
-	(*idx)++;
+	ContextMenu_addItemCapped(items, idx, CONTEXTMENU_MAX_ITEMS, label, id);
 }
 
 // A game's items, as in a ROM listing. allow_pin false leaves out Pin/Unpin Item.
@@ -1963,6 +1881,8 @@ void GameList_openContextMenuFor(Entry* entry, bool is_pin, bool is_continue) {
 		return;
 	GameList_contextMenuClosed();
 	ctx_target = Entry_newNamed(entry->path, entry->type, entry->name);
+	if (!ctx_target)
+		return; // out of memory: no menu
 	if (entry->unique)
 		ctx_target->unique = strdup(entry->unique);
 	MenuTabs_leaveFocus(); // the menu opens over lit content

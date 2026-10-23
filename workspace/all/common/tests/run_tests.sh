@@ -8,6 +8,8 @@ cc -std=gnu99 -Wall -Werror -o /tmp/nx_test_xtras_compat ../../extras/xtras_comp
 /tmp/nx_test_xtras_compat
 cc -std=gnu99 -Wall -Werror -Wno-deprecated-declarations -fsanitize=address -g -I.. -I../../../tg5040/platform -DPLATFORM=\"tg5040\" -o /tmp/nx_test_art_path ../utils.c test_art_path.c
 /tmp/nx_test_art_path
+cc -std=gnu99 -Wall -Werror -Wno-deprecated-declarations -fsanitize=address -g -I.. -I../../../tg5040/platform -DPLATFORM=\"tg5040\" -o /tmp/nx_test_cfg_sync ../config.c ../utils.c test_cfg_sync.c
+/tmp/nx_test_cfg_sync
 cc -std=gnu99 -Wall -Werror -fsanitize=address -g -o /tmp/nx_test_text_wrap test_text_wrap.c
 /tmp/nx_test_text_wrap
 cc -std=gnu99 -Wall -Werror -fsanitize=address -g -o /tmp/nx_test_title_fit test_title_fit.c
@@ -20,6 +22,8 @@ cc -std=gnu99 -Wall -Werror -fsanitize=address -g -o /tmp/nx_test_scraper_scan .
 /tmp/nx_test_scraper_scan
 cc -std=gnu99 -Wall -Werror -fsanitize=address -g -o /tmp/nx_test_scraper_systems ../../scraper/scraper_systems.c test_scraper_systems.c
 /tmp/nx_test_scraper_systems
+cc -std=gnu99 -Wall -Werror -fsanitize=address -g -o /tmp/nx_test_scrape_queue ../../scraper/scrape_queue.c test_scrape_queue.c
+/tmp/nx_test_scrape_queue
 cc -std=gnu99 -Wall -Werror -fsanitize=address -g -o /tmp/nx_test_arcade_names ../arcade_names.c test_arcade_names.c
 /tmp/nx_test_arcade_names
 cc -std=gnu99 -Wall -Werror -fsanitize=address -g -o /tmp/nx_test_png_palette ../png_palette.c test_png_palette.c -lz
@@ -42,6 +46,8 @@ cc -std=gnu99 -Wall -Werror -fsanitize=address -g -o /tmp/nx_test_core_netplay .
 /tmp/nx_test_core_netplay
 cc -std=gnu99 -Wall -Werror -fsanitize=address -g -o /tmp/nx_test_menutabs_model ../../nextui/menutabs_model.c test_menutabs_model.c
 /tmp/nx_test_menutabs_model
+cc -std=gnu99 -Wall -Werror -Wno-deprecated-declarations -fsanitize=address -g -I.. -I../../../tg5040/platform -DPLATFORM=\"tg5040\" -o /tmp/nx_test_nextui_types ../../nextui/types.c ../utils.c test_nextui_types.c
+/tmp/nx_test_nextui_types
 cc -std=gnu99 -Wall -Werror -fsanitize=address -g -o /tmp/nx_test_list_window ../../nextui/list_window.c test_list_window.c
 /tmp/nx_test_list_window
 cc -std=gnu99 -Wall -Werror -fsanitize=address -g -o /tmp/nx_test_emulist_model ../../nextui/emulist_model.c test_emulist_model.c
@@ -96,6 +102,8 @@ cc -std=gnu99 -Wall -Werror -fsanitize=address -g -I../ui -o /tmp/nx_test_menu_t
 /tmp/nx_test_menu_transition
 cc -std=gnu99 -Wall -Werror -fsanitize=address -g -o /tmp/nx_test_romkey ../../nextui/romkey.c test_romkey.c
 /tmp/nx_test_romkey
+cc -std=gnu99 -Wall -Werror -fsanitize=address -g -o /tmp/nx_test_line_rewrite ../../nextui/line_rewrite.c test_line_rewrite.c
+/tmp/nx_test_line_rewrite
 cc -std=gnu99 -Wall -Werror -Wno-deprecated-declarations -fsanitize=address -g -I.. -o /tmp/nx_test_ra_offline test_ra_offline.c ../ra_offline.c
 (cd /tmp && mkdir -p build && /tmp/nx_test_ra_offline)
 cc -std=gnu99 -Wall -Werror -Wno-deprecated-declarations -fsanitize=address -g -I.. -o /tmp/nx_test_ra_hash_cache test_ra_hash_cache.c ../ra_hash_cache.c ../cjson/cJSON.c
@@ -107,8 +115,9 @@ RC=../../minarch/rcheevos/src
 if [ -d "$RC/src/rapi" ]; then
 	RC=$(cd "$RC" && pwd)
 	mkdir -p /tmp/nx_rcinc && ln -sfn "$RC/include" /tmp/nx_rcinc/rcheevos
-	cc -std=gnu99 -w -fsanitize=address -g -I.. -I/tmp/nx_rcinc -I"$RC/include" -I"$RC/src" \
-		-o /tmp/nx_test_ra_offline_net test_ra_offline_net.c ../ra_offline_net.c ../ra_offline.c \
+	cc -std=gnu99 -w -fsanitize=address -g -I.. -I../../../tg5040/platform -DPLATFORM=\"tg5040\" \
+		-I/tmp/nx_rcinc -I"$RC/include" -I"$RC/src" \
+		-o /tmp/nx_test_ra_offline_net test_ra_offline_net.c ../ra_offline_net.c ../ra_offline.c ../utils.c \
 		"$RC"/src/rapi/*.c "$RC"/src/rcheevos/*.c "$RC/src/rc_util.c" "$RC/src/rc_compat.c" \
 		"$RC/src/rc_version.c" "$RC/src/rhash/md5.c"
 	/tmp/nx_test_ra_offline_net
@@ -117,3 +126,74 @@ else
 fi
 cc -std=gnu99 -Wall -Werror -fsanitize=address -g -I.. -o /tmp/nx_test_emu_shortcuts ../emu_shortcuts.c test_emu_shortcuts.c
 /tmp/nx_test_emu_shortcuts
+cc -std=gnu99 -Wall -Werror -Wno-deprecated-declarations -fsanitize=address -g -I.. -I../../../tg5040/platform -DPLATFORM=\"tg5040\" -o /tmp/nx_test_utils_strings ../utils.c test_utils_strings.c
+/tmp/nx_test_utils_strings
+cc -std=gnu99 -Wall -Werror -fsanitize=address -g -o /tmp/nx_test_wifi_scan_line test_wifi_scan_line.c
+/tmp/nx_test_wifi_scan_line
+cc -std=gnu99 -Wall -Werror -fsanitize=address -g -o /tmp/nx_test_shader_strip test_shader_strip.c
+/tmp/nx_test_shader_strip
+cc -std=gnu99 -Wall -Werror -fsanitize=address -g -o /tmp/nx_test_bt_addr test_bt_addr.c
+/tmp/nx_test_bt_addr
+cc -std=gnu99 -Wall -Werror -fsanitize=address -g -o /tmp/nx_test_image_probe ../image_probe.c test_image_probe.c
+/tmp/nx_test_image_probe
+cc -std=gnu99 -Wall -Werror -fsanitize=address -g -o /tmp/nx_test_http_parse test_http_parse.c
+/tmp/nx_test_http_parse
+cc -std=gnu99 -Wall -Werror -fsanitize=address -g -o /tmp/nx_test_ui_image_check test_ui_image_check.c
+/tmp/nx_test_ui_image_check
+cc -std=gnu99 -Wall -Werror -fsanitize=address -g -o /tmp/nx_test_ra_badge_policy test_ra_badge_policy.c
+/tmp/nx_test_ra_badge_policy
+cc -std=gnu99 -Wall -Werror -Wno-deprecated-declarations -fsanitize=address -g -I.. -o /tmp/nx_test_scraper_parse ../../scraper/scraper_parse.c ../cjson/cJSON.c test_scraper_parse.c
+/tmp/nx_test_scraper_parse
+cc -std=gnu99 -Wall -Werror -Wno-deprecated-declarations -fsanitize=address -g -I.. -I../../../tg5040/platform -DPLATFORM=\"tg5040\" -o /tmp/nx_test_scraper_names ../../scraper/scraper_names.c ../utils.c test_scraper_names.c
+/tmp/nx_test_scraper_names
+# common/ and nextui/ coverage (names, radios, wpa escape, BT lines, shader pragmas, RA login, keyboard, list nav)
+SDROOT="-Wno-deprecated-declarations -Isdroot -I.. -DPLATFORM=\"tg5040\""
+PLAT="-Wno-deprecated-declarations -I.. -I../../../tg5040/platform -DPLATFORM=\"tg5040\""
+cc -std=gnu99 -Wall -Werror -fsanitize=address -g $SDROOT -o /tmp/nx_test_utils_names ../utils.c test_utils_names.c
+/tmp/nx_test_utils_names
+cc -std=gnu99 -Wall -Werror -fsanitize=address -g -o /tmp/nx_test_wifi_escape test_wifi_escape.c
+/tmp/nx_test_wifi_escape
+cc -std=gnu99 -Wall -Werror -fsanitize=address -g $PLAT -o /tmp/nx_test_ra_auth_parse ../utils.c test_ra_auth_parse.c
+/tmp/nx_test_ra_auth_parse
+cc -std=gnu99 -Wall -Werror -fsanitize=address -g -o /tmp/nx_test_kb_utf8 test_kb_utf8.c
+/tmp/nx_test_kb_utf8
+cc -std=gnu99 -Wall -Werror -fsanitize=address -g -o /tmp/nx_test_list_nav test_list_nav.c
+/tmp/nx_test_list_nav
+cc -std=gnu99 -Wall -Werror -fsanitize=address -g -o /tmp/nx_test_confirm_wrap test_confirm_wrap.c
+/tmp/nx_test_confirm_wrap
+cc -std=gnu99 -Wall -Werror -Wno-deprecated-declarations -fsanitize=address -g -I.. -o /tmp/nx_test_emu_ovl_write_ini ../emu_overlay_cfg.c ../cjson/cJSON.c test_emu_ovl_write_ini.c
+/tmp/nx_test_emu_ovl_write_ini
+cc -std=gnu99 -Wall -Werror -fsanitize=address -g -o /tmp/nx_test_path_stack ../../nextui/path_stack.c test_path_stack.c
+/tmp/nx_test_path_stack
+cc -std=gnu99 -Wall -Werror -fsanitize=address -g $PLAT -o /tmp/nx_test_gamelist_text ../../nextui/gamelist_text.c ../utils.c test_gamelist_text.c
+/tmp/nx_test_gamelist_text
+cc -std=gnu99 -Wall -Werror -fsanitize=address -g $PLAT -o /tmp/nx_test_entry_names ../../nextui/entry_names.c ../../nextui/types.c ../utils.c test_entry_names.c
+/tmp/nx_test_entry_names
+cc -std=gnu99 -Wall -Werror -fsanitize=address -g $PLAT -o /tmp/nx_test_entry_cache ../../nextui/entry_cache.c ../../nextui/emulist_model.c ../utils.c test_entry_cache.c
+/tmp/nx_test_entry_cache
+# recents.c/shortcuts.c as built, on a fixture card (-Isdroot) with api.h's logging stubbed (-Istubs)
+cc -std=gnu99 -Wall -Werror -fsanitize=address -g -Istubs $SDROOT -o /tmp/nx_test_recents_shortcuts ../../nextui/recents.c ../../nextui/shortcuts.c ../../nextui/path_list.c ../../nextui/types.c ../../nextui/menutabs_model.c ../utils.c test_recents_shortcuts.c
+/tmp/nx_test_recents_shortcuts
+cc -std=gnu99 -Wall -Werror -fsanitize=address -g $PLAT -o /tmp/nx_test_thumbcache_model ../../nextui/thumbcache_model.c test_thumbcache_model.c
+/tmp/nx_test_thumbcache_model
+# shared helpers (dependency-free headers and small modules)
+cc -std=gnu99 -Wall -Werror -fsanitize=address -g -I.. -o /tmp/nx_test_dir_list ../dir_list.c test_dir_list.c
+/tmp/nx_test_dir_list
+cc -std=gnu99 -Wall -Werror -fsanitize=address -g -I.. -o /tmp/nx_test_toast_tick test_toast_tick.c
+/tmp/nx_test_toast_tick
+cc -std=gnu99 -Wall -Werror -fsanitize=address -g -I.. -o /tmp/nx_test_indicator_autohide test_indicator_autohide.c
+/tmp/nx_test_indicator_autohide
+cc -std=gnu99 -Wall -Werror -fsanitize=address -g -I.. -o /tmp/nx_test_proc_spawn ../proc_spawn.c test_proc_spawn.c
+/tmp/nx_test_proc_spawn
+cc -std=gnu99 -Wall -Werror -fsanitize=address -g -I.. -o /tmp/nx_test_settings_kv test_settings_kv.c
+/tmp/nx_test_settings_kv
+cc -std=gnu99 -Wall -Werror -fsanitize=address -g -I.. -o /tmp/nx_test_proc_util test_proc_util.c
+/tmp/nx_test_proc_util
+cc -std=gnu99 -Wall -Werror -fsanitize=address -g -I.. -o /tmp/nx_test_wget_format test_wget_format.c
+/tmp/nx_test_wget_format
+cc -std=gnu99 -Wall -Werror -fsanitize=address -g -I.. -o /tmp/nx_test_folder_tag test_folder_tag.c
+/tmp/nx_test_folder_tag
+cc -std=gnu99 -Wall -Werror -fsanitize=address -g -I.. -o /tmp/nx_test_file_util test_file_util.c
+/tmp/nx_test_file_util
+cc -std=gnu99 -Wall -Werror -fsanitize=address -g -I.. -o /tmp/nx_test_str_trim test_str_trim.c
+/tmp/nx_test_str_trim

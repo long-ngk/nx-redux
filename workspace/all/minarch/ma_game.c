@@ -4,6 +4,8 @@
 #include "ma_game.h"
 #include "ma_saves.h"
 #include "ma_archive_cache.h"
+#include "ma_menu.h"
+#include "ra_integration.h"
 #include <zip.h>
 #include <dirent.h>
 #include <errno.h>
@@ -58,6 +60,10 @@ void Game_open(char* path) {
 				return;
 			}
 			mkdir(tmp_dirname, 0777);
+			// /tmp is RAM: drop every other game's unpacked rom first
+			int evicted = ArchiveCache_evictOthers("/tmp/nextarch", tmp_dirname);
+			if (evicted)
+				LOG_info("Removed %i old unpacked rom folder(s) from /tmp/nextarch\n", evicted);
 
 			int extracted;
 			if (!strcmp("zip", archive_ext)) {
@@ -69,8 +75,10 @@ void Game_open(char* path) {
 			} else {
 				extracted = extract_7z(tmp_dirname, extensions);
 			}
-			if (!extracted)
+			if (!extracted) {
+				rmdir(tmp_dirname); // a refused or failed unpack leaves nothing behind
 				return;
+			}
 			// Update the game name to the extracted file name instead of the archive name
 			if (CFG_getUseExtractedFileName())
 				strcpy((char*)game.alt_name, strrchr(game.tmp_path, '/') + 1);
@@ -126,6 +134,7 @@ void Game_open(char* path) {
 	game.is_open = 1;
 }
 void Game_close(void) {
+	RA_forgetGameData(); // a deferred RA load borrows game.data
 	if (game.data)
 		free(game.data);
 	// why delete tempfile? keep it for next time when loading the game its much faster from /tmp ram folder
@@ -163,6 +172,57 @@ int Game_changeDisc(char* path) {
 	return 1;
 }
 
+// /tmp is RAM: refuse to unpack a rom that would leave too little of it free
+// (filling it starves the core, and the rom is read into RAM again on load).
+// Returns 1 if `needed` bytes fit in dir, else logs, tells the user, returns 0.
+static int has_room_for(const char* dir, unsigned long long needed) {
+	unsigned long long available = ArchiveCache_available(dir);
+	if (ArchiveCache_fits(available, needed))
+		return 1;
+	LOG_error("not enough room in /tmp to unpack `%s': needs %llu MB, %llu MB free\n",
+			  game.path, needed >> 20, available >> 20);
+	char detail[128];
+	snprintf(detail, sizeof(detail), "Unpacking needs %llu MB of memory, %llu MB is free.",
+			 (needed + ARCHIVE_CACHE_RESERVE) >> 20, available >> 20);
+	Menu_notice("Game too big to unzip", detail, 3000);
+	return 0;
+}
+
+// Unpacked size of every entry of the 7z archive at game.path, read from a
+// `7zzs l -slt` listing; -1 if it can't be listed.
+static long long sevenzip_unpacked_size(const char* sevenzip_bin) {
+	int fds[2];
+	if (pipe(fds) != 0)
+		return -1;
+	char* argv[] = {(char*)sevenzip_bin, "l", "-slt", (char*)game.path, NULL};
+	pid_t pid = fork();
+	if (pid == 0) {
+		dup2(fds[1], STDOUT_FILENO);
+		close(fds[0]);
+		close(fds[1]);
+		execv(argv[0], argv);
+		_exit(127);
+	}
+	close(fds[1]);
+	if (pid < 0) {
+		close(fds[0]);
+		return -1;
+	}
+	long long total = -1;
+	FILE* f = fdopen(fds[0], "r");
+	if (f) {
+		total = ArchiveCache_sum7zListing(f);
+		fclose(f);
+	} else {
+		close(fds[0]);
+	}
+	int status = 0;
+	waitpid(pid, &status, 0);
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+		return -1;
+	return total;
+}
+
 int extract_zip(const char* tmp_dirname, char** extensions) {
 	// only runs on the main thread at game load; a big buffer keeps the
 	// read/write syscall count sane for multi-MB roms
@@ -192,16 +252,7 @@ int extract_zip(const char* tmp_dirname, char** extensions) {
 			if (len > 0 && sb.name[len - 1] == '/') {
 				snprintf(game.tmp_path, sizeof(game.tmp_path), "%s/%s", tmp_dirname, basename(entry_name));
 			} else {
-				int found = 0;
-				char extension[34];
-				for (int e = 0; extensions[e]; e++) {
-					snprintf(extension, sizeof(extension), ".%s", extensions[e]);
-					if (suffixMatch(extension, sb.name)) {
-						found = 1;
-						break;
-					}
-				}
-				if (!found)
+				if (!ArchiveCache_hasExtension(sb.name, extensions))
 					continue;
 
 				snprintf(game.tmp_path, sizeof(game.tmp_path), "%s/%s", tmp_dirname, basename(entry_name));
@@ -213,6 +264,9 @@ int extract_zip(const char* tmp_dirname, char** extensions) {
 					result = 1;
 					goto done;
 				}
+
+				if (!has_room_for(tmp_dirname, (unsigned long long)sb.size))
+					goto done;
 
 				zf = zip_fopen_index(za, i, 0);
 				if (!zf) {
@@ -290,6 +344,19 @@ done:
 }
 
 int extract_7z(const char* tmp_dirname, char** extensions) {
+	static char sevenzip_bin[MAX_PATH];
+	snprintf(sevenzip_bin, sizeof(sevenzip_bin), "%s/7zzs.aarch64", SHARED_BIN_PATH);
+
+	// `7z e` unpacks every entry: all of them must fit. If the archive can't
+	// be listed, its own size is the lower bound.
+	long long needed = sevenzip_unpacked_size(sevenzip_bin);
+	if (needed < 0) {
+		struct stat st;
+		needed = stat(game.path, &st) == 0 ? (long long)st.st_size : 0;
+	}
+	if (!has_room_for(tmp_dirname, (unsigned long long)needed))
+		return 0;
+
 	// extract into a private staging dir first, so only the rom itself lands
 	// in the archive's cache folder and only once it is complete
 	char staging[MAX_PATH];
@@ -301,8 +368,6 @@ int extract_7z(const char* tmp_dirname, char** extensions) {
 
 	char out_arg[MAX_PATH + 3];
 	snprintf(out_arg, sizeof(out_arg), "-o%s", staging);
-	static char sevenzip_bin[MAX_PATH];
-	snprintf(sevenzip_bin, sizeof(sevenzip_bin), "%s/7zzs.aarch64", SHARED_BIN_PATH);
 	char* argv[] = {sevenzip_bin, "e", (char*)game.path, out_arg, "-y", NULL};
 
 	int ok = 0;
@@ -332,16 +397,7 @@ int extract_7z(const char* tmp_dirname, char** extensions) {
 				continue;
 			snprintf(src, sizeof(src), "%s/%s", staging, entry->d_name);
 			if (ok && !result) {
-				int found = 0;
-				char extension[34];
-				for (int e = 0; extensions[e]; e++) {
-					snprintf(extension, sizeof(extension), ".%s", extensions[e]);
-					if (suffixMatch(extension, entry->d_name)) {
-						found = 1;
-						break;
-					}
-				}
-				if (found) {
+				if (ArchiveCache_hasExtension(entry->d_name, extensions)) {
 					snprintf(game.tmp_path, sizeof(game.tmp_path), "%s/%s", tmp_dirname, entry->d_name);
 					if (rename(src, game.tmp_path) == 0) {
 						result = 1;

@@ -21,6 +21,8 @@
 #include "msettings.h"
 #include "defines.h"
 #include "spk_guard.h"
+#include "audiomon_parse.h"
+#include "settings_kv.h"
 
 #define AUDIO_FILE USERDATA_PATH "/.asoundrc"
 #define UUID_A2DP "0000110b-0000-1000-8000-00805f9b34fb"
@@ -45,6 +47,11 @@ static volatile sig_atomic_t republish_requested = 0;
 static volatile sig_atomic_t game_volume_requested = 0;
 static int active_rate = 48000;
 static int applied_game_volume = -1;
+// A volume the mixer refused (no Game Volume control on this route yet): the
+// main loop retries it with back-off instead of forking amixer every pass
+static int failed_game_volume = -1;
+static int game_volume_backoff_s = 0;
+static time_t game_volume_retry_at = 0;
 static int logged_game_volume_error = -1;
 
 // Mirrors what write_audio_file()/clear_audio_file() last routed —
@@ -263,22 +270,7 @@ static void spk_guard_poll(void) {
 static int read_cfg_int(const char* key, int fallback) {
 	char path[512];
 	snprintf(path, sizeof(path), "%s/minuisettings.txt", SHARED_USERDATA_PATH);
-	FILE* f = fopen(path, "r");
-	if (!f)
-		return fallback;
-	char line[256];
-	char pattern[64];
-	snprintf(pattern, sizeof(pattern), "%s=%%i", key);
-	int value = fallback;
-	while (fgets(line, sizeof(line), f)) {
-		int v;
-		if (sscanf(line, pattern, &v) == 1) {
-			value = v;
-			break;
-		}
-	}
-	fclose(f);
-	return value;
+	return settings_kv_int(path, key, fallback);
 }
 
 // A2DP negotiated rate: the raw bluealsa PCM (not via plug) constrains
@@ -396,6 +388,7 @@ static bool apply_game_volume(const char* card, bool prime) {
 	if (prime) {
 		applied_game_volume = -1;
 		logged_game_volume_error = -1;
+		failed_game_volume = -1; // new route: try right away
 		char prime_command[256];
 		snprintf(prime_command, sizeof(prime_command),
 				 "dd if=/dev/zero bs=4096 count=1 2>/dev/null | aplay -q -D nx_game -f S16_LE -r %d -c 2 2>/dev/null",
@@ -427,12 +420,32 @@ static bool apply_game_volume(const char* card, bool prime) {
 	return true;
 }
 
+static time_t monotonic_seconds(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec;
+}
+
 static void apply_game_volume_if_changed(void) {
 	int volume = clamp_game_volume(GetGameVolume());
 	if (volume == applied_game_volume || current_route == ROUTED_BLUETOOTH)
 		return;
+	time_t now = monotonic_seconds();
+	if (volume == failed_game_volume && now < game_volume_retry_at)
+		return; // refused before: wait out the back-off (a new value retries at once)
 	const char* card = current_route == ROUTED_USB ? current_usb_card : "audiocodec";
-	(void)apply_game_volume(card, false);
+	if (apply_game_volume(card, false)) {
+		failed_game_volume = -1;
+		game_volume_backoff_s = 0;
+		return;
+	}
+	// 1, 2, 4 ... 60 s between retries of the same refused value
+	if (volume != failed_game_volume)
+		game_volume_backoff_s = 1;
+	else if (game_volume_backoff_s < 60)
+		game_volume_backoff_s = game_volume_backoff_s * 2 > 60 ? 60 : game_volume_backoff_s * 2;
+	failed_game_volume = volume;
+	game_volume_retry_at = now + game_volume_backoff_s;
 }
 
 static void write_default_audio_file(void) {
@@ -526,25 +539,9 @@ static void clear_audio_file(void) {
 	}
 }
 
-// Extract MAC address from D-Bus object path
-// Path format: .../dev_AA_BB_CC_DD_EE_FF/...
-// Returns length written to out (excluding NUL), or 0 on failure
+// Extract MAC address from D-Bus object path (see audiomon_parse.h)
 static int path_to_mac(const char* path, char* out, size_t out_size) {
-	const char* p = strstr(path, "dev_");
-	if (!p || out_size < 18)
-		return 0;
-
-	p += 4; // skip "dev_"
-
-	// Copy up to 17 chars (AA_BB_CC_DD_EE_FF), replacing '_' with ':'
-	int i = 0;
-	while (*p && *p != '/' && i < 17) {
-		out[i] = (*p == '_') ? ':' : *p;
-		i++;
-		p++;
-	}
-	out[i] = '\0';
-	return i;
+	return audiomon_path_to_mac(path, out, out_size);
 }
 
 // Extract ALSA card number from udev device

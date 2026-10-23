@@ -27,6 +27,7 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/file.h>
+#include "shader_strip.h"
 
 static void bandShadowInvalidate(void);
 
@@ -559,6 +560,8 @@ static uint32_t capture_mono_ms(void);
 #define OVERLAYS_FOLDER SDCARD_PATH "/Overlays"
 
 static char* overlay_path = NULL;
+// Guards overlay_path, effect state and frame_prep (PrepareFrameThread)
+static pthread_mutex_t video_prep_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Notification overlay state for RA achievements
 typedef struct {
@@ -586,41 +589,34 @@ void PLAT_clearNotificationSurface(void) {
 	notif.clear_frames = 3; // Clear for 3 frames (triple buffering safety)
 }
 
+// PLAT_GL_screenCaptureClean: the next PLAT_GL_Swap skips the notification pass
+// and reads its frame back here, before the swap
+static bool clean_capture;
+static unsigned char* clean_pixels;
+static int clean_w, clean_h;
+
 
 #define MAX_SHADERLINE_LENGTH 512
 int extractPragmaParameters(const char* shaderSource, ShaderParam* params, int maxParams) {
-	const char* pragmaPrefix = "#pragma parameter";
 	char line[MAX_SHADERLINE_LENGTH];
 	int paramCount = 0;
 
 	const char* currentPos = shaderSource;
 
 	while (*currentPos && paramCount < maxParams) {
-		int i = 0;
+		ShaderStrip_readLine(&currentPos, line, sizeof(line));
 
-		// Read a line
-		while (*currentPos && *currentPos != '\n' && i < MAX_SHADERLINE_LENGTH - 1) {
-			line[i++] = *currentPos++;
-		}
-		line[i] = '\0';
-		if (*currentPos == '\n')
-			currentPos++;
-
-		// Check if it's a #pragma parameter line
-		if (strncmp(line, pragmaPrefix, strlen(pragmaPrefix)) == 0) {
-			const char* start = line + strlen(pragmaPrefix);
-			while (*start == ' ')
-				start++;
-
-			ShaderParam* p = &params[paramCount];
-
-			// Try to parse
-			if (sscanf(start, "%127s \"%127[^\"]\" %f %f %f %f",
-					   p->name, p->label, &p->def, &p->min, &p->max, &p->step) == 6) {
-				paramCount++;
-			} else {
-				fprintf(stderr, "Failed to parse line:\n%s\n", line);
-			}
+		ShaderParam* p = &params[paramCount];
+		float vals[4];
+		int parsed = ShaderStrip_parsePragma(line, p->name, p->label, vals);
+		if (parsed > 0) {
+			p->def = vals[0];
+			p->min = vals[1];
+			p->max = vals[2];
+			p->step = vals[3];
+			paramCount++;
+		} else if (parsed < 0) {
+			fprintf(stderr, "Failed to parse line:\n%s\n", line);
 		}
 	}
 
@@ -726,6 +722,10 @@ char* load_shader_source(const char* filename) {
 	fseek(file, 0, SEEK_END);
 	long length = ftell(file);
 	rewind(file);
+	if (length < 0) {
+		fclose(file);
+		return NULL;
+	}
 
 	char* source = (char*)malloc(length + 1);
 	if (!source) {
@@ -734,8 +734,8 @@ char* load_shader_source(const char* filename) {
 		return NULL;
 	}
 
-	fread(source, 1, length, file);
-	source[length] = '\0';
+	size_t got = fread(source, 1, length, file);
+	source[got] = '\0';
 	fclose(file);
 	return source;
 }
@@ -750,21 +750,11 @@ GLuint load_shader_from_file(GLenum type, const char* filename, const char* path
 	LOG_info("load shader from file %s\n", filepath);
 
 	// Filter out lines starting with "#pragma parameter"
-	char* cleaned = malloc(strlen(source) + 1);
+	char* cleaned = ShaderStrip_parameters(source);
 	if (!cleaned) {
 		fprintf(stderr, "Out of memory\n");
 		free(source);
 		return 0;
-	}
-	cleaned[0] = '\0';
-
-	char* line = strtok(source, "\n");
-	while (line) {
-		if (strncmp(line, "#pragma parameter", 17) != 0) {
-			strcat(cleaned, line);
-			strcat(cleaned, "\n");
-		}
-		line = strtok(NULL, "\n");
 	}
 
 	const char* define = NULL;
@@ -1286,8 +1276,10 @@ void PLAT_quitVideo(void) {
 
 	// Cleanup and shutdown
 	SDL_DestroyWindow(vid.window);
-	if (overlay_path)
-		free(overlay_path);
+	pthread_mutex_lock(&video_prep_mutex);
+	free(overlay_path);
+	overlay_path = NULL;
+	pthread_mutex_unlock(&video_prep_mutex);
 
 	SDL_QuitSubSystem(SDL_INIT_VIDEO);
 }
@@ -1384,7 +1376,6 @@ static struct FX_Context {
 static char* effect_path;
 static char effect_path_buf[MAX_PATH];
 static int effectUpdated = 0;
-static pthread_mutex_t video_prep_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void updateEffect(void) {
 	// Read effect state with mutex protection
@@ -1492,34 +1483,33 @@ void PLAT_setOverlay(const char* filename, const char* tag) {
 		SDL_DestroyTexture(vid.overlay);
 		vid.overlay = NULL;
 	}
-	if (overlay_path) {
-		free(overlay_path);
-		overlay_path = NULL;
+
+	char* new_path = NULL;
+	if (!filename || strcmp(filename, "") == 0 || strcmp(filename, "None") == 0) {
+		new_path = strdup("");
+		LOG_info("Skipping overlay update.\n");
+	} else {
+		char overlays_folder[MAX_PATH];
+		snprintf(overlays_folder, sizeof(overlays_folder), "%s/Overlays", SDCARD_PATH);
+
+		size_t path_len = strlen(overlays_folder) + strlen(tag) + strlen(filename) + 4; // +3 for slashes and null-terminator
+		new_path = malloc(path_len);
+		if (!new_path) {
+			perror("malloc failed");
+		} else {
+			snprintf(new_path, path_len, "%s/%s/%s", overlays_folder, tag, filename);
+			LOG_info("Overlay path set to: %s\n", new_path);
+		}
 	}
 
+	// PrepareFrameThread copies overlay_path under this mutex before loading,
+	// so the old string can only be freed once it is swapped out here.
 	pthread_mutex_lock(&video_prep_mutex);
+	char* old_path = overlay_path;
+	overlay_path = new_path;
 	overlayUpdated = 1;
 	pthread_mutex_unlock(&video_prep_mutex);
-
-	if (!filename || strcmp(filename, "") == 0 || strcmp(filename, "None") == 0) {
-		overlay_path = strdup("");
-		LOG_info("Skipping overlay update.\n");
-		return;
-	}
-
-	char overlays_folder[MAX_PATH];
-	snprintf(overlays_folder, sizeof(overlays_folder), "%s/Overlays", SDCARD_PATH);
-
-	size_t path_len = strlen(overlays_folder) + strlen(tag) + strlen(filename) + 4; // +3 for slashes and null-terminator
-	overlay_path = malloc(path_len);
-
-	if (!overlay_path) {
-		perror("malloc failed");
-		return;
-	}
-
-	snprintf(overlay_path, path_len, "%s/%s/%s", overlays_folder, tag, filename);
-	LOG_info("Overlay path set to: %s\n", overlay_path);
+	free(old_path);
 }
 
 
@@ -3218,16 +3208,21 @@ int prepareFrameThread(void* data) {
 				}
 
 				pthread_mutex_lock(&video_prep_mutex);
+				SDL_Surface* old = frame_prep.loaded_effect;
 				frame_prep.loaded_effect = converted;
 				effectUpdated = 0;
 				frame_prep.effect_ready = 1;
 				pthread_mutex_unlock(&video_prep_mutex);
+				// PLAT_GL_Swap only touches loaded_* while holding the mutex
+				SDL_FreeSurface(old);
 			} else {
 				pthread_mutex_lock(&video_prep_mutex);
+				SDL_Surface* old = frame_prep.loaded_effect;
 				frame_prep.loaded_effect = 0;
 				effectUpdated = 0;
 				frame_prep.effect_ready = 1;
 				pthread_mutex_unlock(&video_prep_mutex);
+				SDL_FreeSurface(old);
 			}
 		}
 
@@ -3239,9 +3234,11 @@ int prepareFrameThread(void* data) {
 
 		if (effect_type == EFFECT_NONE && loaded_effect != 0) {
 			pthread_mutex_lock(&video_prep_mutex);
+			SDL_Surface* old = frame_prep.loaded_effect;
 			frame_prep.loaded_effect = 0;
 			frame_prep.effect_ready = 1;
 			pthread_mutex_unlock(&video_prep_mutex);
+			SDL_FreeSurface(old);
 		}
 
 		// Check overlayUpdated flag with mutex
@@ -3251,8 +3248,16 @@ int prepareFrameThread(void* data) {
 
 		if (overlay_updated) {
 			LOG_info("overlay updated\n");
-			if (overlay_path) {
-				SDL_Surface* tmp = IMG_Load(overlay_path);
+			// Copy the path: PLAT_setOverlay may replace it on the main thread
+			// while IMG_Load runs.
+			char path[MAX_PATH];
+			pthread_mutex_lock(&video_prep_mutex);
+			int have_path = overlay_path != NULL;
+			if (have_path)
+				snprintf(path, sizeof(path), "%s", overlay_path);
+			pthread_mutex_unlock(&video_prep_mutex);
+			if (have_path) {
+				SDL_Surface* tmp = path[0] ? IMG_Load(path) : NULL;
 				SDL_Surface* converted = NULL;
 				if (tmp) {
 					converted = SDL_ConvertSurfaceFormat(tmp, SDL_PIXELFORMAT_RGBA32, 0);
@@ -3260,16 +3265,20 @@ int prepareFrameThread(void* data) {
 				}
 
 				pthread_mutex_lock(&video_prep_mutex);
+				SDL_Surface* old = frame_prep.loaded_overlay;
 				frame_prep.loaded_overlay = converted;
 				frame_prep.overlay_ready = 1;
 				overlayUpdated = 0;
 				pthread_mutex_unlock(&video_prep_mutex);
+				SDL_FreeSurface(old);
 			} else {
 				pthread_mutex_lock(&video_prep_mutex);
+				SDL_Surface* old = frame_prep.loaded_overlay;
 				frame_prep.loaded_overlay = 0;
 				frame_prep.overlay_ready = 1;
 				overlayUpdated = 0;
 				pthread_mutex_unlock(&video_prep_mutex);
+				SDL_FreeSurface(old);
 			}
 		}
 
@@ -3352,13 +3361,12 @@ void PLAT_GL_Swap() {
 		reloadShaderTextures = 1;
 	}
 
-	// Check if effect needs updating
+	// Check if effect / overlay need updating. The mutex stays held across the
+	// uploads: PrepareFrameThread frees a replaced surface right after swapping
+	// it out, so its pixels are only valid while the lock is held.
 	pthread_mutex_lock(&video_prep_mutex);
-	int effect_ready = frame_prep.effect_ready;
-	SDL_Surface* loaded_effect = frame_prep.loaded_effect;
-	pthread_mutex_unlock(&video_prep_mutex);
-
-	if (effect_ready) {
+	if (frame_prep.effect_ready) {
+		SDL_Surface* loaded_effect = frame_prep.loaded_effect;
 		if (loaded_effect) {
 			if (!effect_tex)
 				glGenTextures(1, &effect_tex);
@@ -3376,18 +3384,11 @@ void PLAT_GL_Swap() {
 			}
 			effect_tex = 0;
 		}
-		pthread_mutex_lock(&video_prep_mutex);
 		frame_prep.effect_ready = 0;
-		pthread_mutex_unlock(&video_prep_mutex);
 	}
 
-	// Check if overlay needs updating
-	pthread_mutex_lock(&video_prep_mutex);
-	int overlay_ready = frame_prep.overlay_ready;
-	SDL_Surface* loaded_overlay = frame_prep.loaded_overlay;
-	pthread_mutex_unlock(&video_prep_mutex);
-
-	if (overlay_ready) {
+	if (frame_prep.overlay_ready) {
+		SDL_Surface* loaded_overlay = frame_prep.loaded_overlay;
 		if (loaded_overlay) {
 			if (!overlay_tex)
 				glGenTextures(1, &overlay_tex);
@@ -3406,10 +3407,9 @@ void PLAT_GL_Swap() {
 			}
 			overlay_tex = 0;
 		}
-		pthread_mutex_lock(&video_prep_mutex);
 		frame_prep.overlay_ready = 0;
-		pthread_mutex_unlock(&video_prep_mutex);
 	}
+	pthread_mutex_unlock(&video_prep_mutex);
 
 	GLuint frame_tex = src_texture;
 	int hwr_direct = 0;
@@ -3593,7 +3593,9 @@ void PLAT_GL_Swap() {
 		notif.dirty = 0;
 	}
 
-	if (notif.tex && notif.surface) {
+	if (clean_capture) {
+		clean_pixels = PLAT_GL_screenCapture(&clean_w, &clean_h);
+	} else if (notif.tex && notif.surface) {
 		runShaderPass(
 			notif.tex,
 			g_shader_overlay,
@@ -3609,6 +3611,26 @@ void PLAT_GL_Swap() {
 	frame_count++;
 	reloadShaderTextures = 0;
 	shaderResetRequested = 0;
+}
+
+// The last frame without toasts or indicators on it (the in-game menu's
+// background, save-state and Game Switcher pictures): redraws it once with
+// the notification pass skipped. Falls back to the plain capture when there
+// is no frame to redraw.
+unsigned char* PLAT_GL_screenCaptureClean(int* outWidth, int* outHeight) {
+	clean_capture = true;
+	clean_pixels = NULL;
+	PLAT_GL_Swap();
+	clean_capture = false;
+	if (!clean_pixels)
+		return PLAT_GL_screenCapture(outWidth, outHeight);
+	unsigned char* pixels = clean_pixels;
+	clean_pixels = NULL;
+	if (outWidth)
+		*outWidth = clean_w;
+	if (outHeight)
+		*outHeight = clean_h;
+	return pixels; // caller must free
 }
 
 // flipping image upside down

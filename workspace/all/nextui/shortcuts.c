@@ -2,6 +2,7 @@
 #include "api.h"
 #include "defines.h"
 #include "menutabs_model.h"
+#include "path_list.h"
 #include "utils.h"
 #include <stdbool.h>
 #include <stdio.h>
@@ -20,18 +21,34 @@ typedef struct Shortcut {
 ///////////////////////////////////////
 // Shortcut functions
 
-static Shortcut* Shortcut_new(char* path, char* name) {
-	Shortcut* self = malloc(sizeof(Shortcut));
-	self->path = strdup(path);
-	self->name = name ? strdup(name) : NULL;
-	return self;
-}
-
 static void Shortcut_free(Shortcut* self) {
 	free(self->path);
 	if (self->name)
 		free(self->name);
 	free(self);
+}
+
+static Shortcut* Shortcut_new(char* path, char* name) {
+	Shortcut* self = malloc(sizeof(Shortcut));
+	if (!self)
+		return NULL;
+	self->path = strdup(path);
+	self->name = name ? strdup(name) : NULL;
+	if (!self->path || (name && !self->name)) {
+		Shortcut_free(self);
+		return NULL;
+	}
+	return self;
+}
+
+// Appends a fresh Shortcut_new result; false (freeing it) when it's NULL or the array can't grow.
+static bool ShortcutArray_push(Array* self, Shortcut* shortcut) {
+	if (!shortcut)
+		return false;
+	if (Array_push(self, shortcut))
+		return true;
+	Shortcut_free(shortcut);
+	return false;
 }
 
 static int ShortcutArray_indexOf(Array* self, const char* path) {
@@ -58,26 +75,15 @@ static Array* shortcuts = NULL;
 ///////////////////////////////////////
 // Save/Load functions
 
+static void Shortcut_get(void* item, const char** path, const char** label) {
+	Shortcut* shortcut = item;
+	*path = shortcut->path;
+	*label = shortcut->name;
+}
+
 static void saveShortcuts(void) {
-	// one buffer, written via writeFileAtomic (tmp + fsync + rename): a crash or a full card mid-write can't
-	// truncate the pins
-	size_t cap = 1, len = 0;
-	for (int i = 0; i < shortcuts->count; i++) {
-		Shortcut* shortcut = shortcuts->items[i];
-		cap += strlen(shortcut->path) + 2 + (shortcut->name ? strlen(shortcut->name) : 0);
-	}
-	char* buf = malloc(cap);
-	if (!buf)
-		return;
-	for (int i = 0; i < shortcuts->count; i++) {
-		Shortcut* shortcut = shortcuts->items[i];
-		len += (size_t)snprintf(buf + len, cap - len, "%s%s%s\n", shortcut->path, shortcut->name ? "\t" : "",
-								shortcut->name ? shortcut->name : "");
-	}
-	buf[len] = '\0';
-	if (!writeFileAtomic(SHORTCUTS_PATH, buf, len))
+	if (!PathList_save(SHORTCUTS_PATH, shortcuts, Shortcut_get))
 		LOG_warn("Shortcuts: couldn't save %s\n", SHORTCUTS_PATH);
-	free(buf);
 }
 
 static int loadShortcuts(void) {
@@ -90,28 +96,8 @@ static int loadShortcuts(void) {
 	FILE* file = fopen(SHORTCUTS_PATH, "r");
 	if (file) {
 		char line[MAX_PATH * 2]; // "path\tname": each up to a path's length
-		while (fgets(line, sizeof(line), file) != NULL) {
-			size_t len = strlen(line);
-			if (len == sizeof(line) - 1 && line[len - 1] != '\n') {
-				// longer than any path plus name: skip the whole line rather than split it, which would read
-				// its tail as a bogus entry (and a re-save would keep only the cut-down head)
-				int c;
-				while ((c = fgetc(file)) != EOF && c != '\n')
-					;
-				continue;
-			}
-			normalizeNewline(line);
-			trimTrailingNewlines(line);
-			if (strlen(line) == 0)
-				continue;
-
-			char* path = line;
-			char* name = NULL;
-			char* tmp = strchr(line, '\t');
-			if (tmp) {
-				tmp[0] = '\0';
-				name = tmp + 1;
-			}
+		char *path, *name;
+		while (PathList_nextLine(file, line, sizeof(line), &path, &name, NULL)) {
 			if (strlen(path) >= MAX_PATH)
 				continue; // no such path on the card
 
@@ -120,7 +106,7 @@ static int loadShortcuts(void) {
 			snprintf(sd_path, sizeof(sd_path), "%s%s", SDCARD_PATH, path);
 
 			if (exists(sd_path)) {
-				Array_push(shortcuts, Shortcut_new(path, name));
+				ShortcutArray_push(shortcuts, Shortcut_new(path, name));
 			} else {
 				removed_any = true;
 			}
@@ -188,7 +174,8 @@ void Shortcuts_add(Entry* entry) {
 		LOG_warn("Shortcuts_add: pin limit reached, not adding %s\n", path);
 		return;
 	}
-	Array_push(shortcuts, Shortcut_new(path, entry->name)); // appended: pins keep the order they were added
+	if (!ShortcutArray_push(shortcuts, Shortcut_new(path, entry->name))) // appended: pins keep the order they were added
+		return;
 	saveShortcuts();
 }
 
@@ -215,11 +202,19 @@ bool Shortcuts_replacePath(const char* old_path, const char* new_path, const cha
 	if (idx == -1)
 		return false;
 	Shortcut* shortcut = shortcuts->items[idx];
+	// both copies first: out of memory leaves the pin as it was (a NULL path would crash every later lookup)
+	char* path = strdup(new_path);
+	char* name = new_name ? strdup(new_name) : NULL;
+	if (!path || (new_name && !name)) {
+		free(path);
+		free(name);
+		return false;
+	}
 	free(shortcut->path);
-	shortcut->path = strdup(new_path); // same slot: the pin keeps its place
-	if (new_name) {
+	shortcut->path = path; // same slot: the pin keeps its place
+	if (name) {
 		free(shortcut->name);
-		shortcut->name = strdup(new_name);
+		shortcut->name = name;
 	}
 	saveShortcuts();
 	return true;

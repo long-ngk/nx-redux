@@ -17,6 +17,7 @@
 #include "defines.h"
 #include "api.h"
 #include "config.h"
+#include "bt_addr.h"
 
 #include <msettings.h>
 #include <pthread.h>
@@ -393,6 +394,8 @@ static BluetoothDeviceType bt_get_device_type(const char* addr) {
 	char cmd[256];
 	char output[2048];
 
+	if (!BtAddr_isValid(addr)) // goes into a shell command line
+		return BLUETOOTH_NONE;
 	snprintf(cmd, sizeof(cmd), "bluetoothctl info %s 2>/dev/null", addr);
 	if (bt_run_cmd(cmd, output, sizeof(output)) == 0) {
 		return bt_parse_device_class(output);
@@ -486,7 +489,7 @@ void PLAT_bluetoothDiscovery(int on) {
 				char* line = strtok(rm_output, "\n");
 				while (line) {
 					char addr[18] = {0};
-					if (strncmp(line, "Device ", 7) == 0 && sscanf(line, "Device %17s", addr) == 1) {
+					if (BtAddr_parseDeviceLine(line, addr, NULL, 0)) {
 						int keep = 0;
 						for (int i = 0; i < keep_count; i++) {
 							if (strcmp(keep_list[i].remote_addr, addr) == 0) {
@@ -541,23 +544,11 @@ int PLAT_bluetoothScan(struct BT_device* devices, int max) {
 		char name[249] = {0};
 
 		// Parse "Device XX:XX:XX:XX:XX:XX Name"
-		if (strncmp(line, "Device ", 7) == 0) {
-			if (sscanf(line, "Device %17s", addr) == 1) {
-				// Get name (everything after the address). "Device " (7) +
-				// "XX:XX:XX:XX:XX:XX " (18) = 25 bytes precede the name;
-				// bounds-check so a line with no trailing space can't over-read.
-				if (strlen(line) >= 25) {
-					char* name_start = line + 7 + 18;
-					if (*name_start) {
-						strncpy(name, name_start, sizeof(name) - 1);
-					}
-				}
-
-				// Get device type — only show audio and controller devices
-				BluetoothDeviceType kind = bt_get_device_type(addr);
-				if (kind == BLUETOOTH_AUDIO || kind == BLUETOOTH_CONTROLLER) {
-					bt_add_discovered_device(addr, name, kind);
-				}
+		if (BtAddr_parseDeviceLine(line, addr, name, sizeof(name))) {
+			// Get device type — only show audio and controller devices
+			BluetoothDeviceType kind = bt_get_device_type(addr);
+			if (kind == BLUETOOTH_AUDIO || kind == BLUETOOTH_CONTROLLER) {
+				bt_add_discovered_device(addr, name, kind);
 			}
 		}
 		line = strtok(NULL, "\n");
@@ -608,6 +599,16 @@ int PLAT_bluetoothScan(struct BT_device* devices, int max) {
 	return count;
 }
 
+// Append more bluetoothctl output lines to out (out_size bytes), on a line of their own
+static void bt_append_lines(char* out, size_t out_size, const char* more) {
+	size_t len = strlen(out);
+	if (len > 0 && out[len - 1] != '\n' && len + 1 < out_size) {
+		out[len++] = '\n';
+		out[len] = '\0';
+	}
+	strncat(out, more, out_size - len - 1);
+}
+
 int PLAT_bluetoothPaired(struct BT_devicePaired* paired, int max) {
 	if (!PLAT_bluetoothEnabled()) {
 		return 0;
@@ -637,26 +638,14 @@ int PLAT_bluetoothPaired(struct BT_devicePaired* paired, int max) {
 	if (bt_version_gte(5, 70)) {
 		char trusted_output[4096];
 		if (bt_run_cmd("bluetoothctl devices Trusted 2>/dev/null", trusted_output, sizeof(trusted_output)) == 0 &&
-			trusted_output[0]) {
-			size_t len = strlen(output);
-			if (len > 0 && output[len - 1] != '\n') {
-				strncat(output, "\n", sizeof(output) - len - 1);
-				len++;
-			}
-			strncat(output, trusted_output, sizeof(output) - len - 1);
-		}
+			trusted_output[0])
+			bt_append_lines(output, sizeof(output), trusted_output);
 	}
 
 	// Also get connected devices and append any that aren't already listed
 	if (bt_run_cmd("bluetoothctl devices Connected 2>/dev/null", connected_output, sizeof(connected_output)) == 0 &&
-		connected_output[0]) {
-		size_t len = strlen(output);
-		if (len > 0 && output[len - 1] != '\n') {
-			strncat(output, "\n", sizeof(output) - len - 1);
-			len++;
-		}
-		strncat(output, connected_output, sizeof(output) - len - 1);
-	}
+		connected_output[0])
+		bt_append_lines(output, sizeof(output), connected_output);
 
 	int count = 0;
 	char* line = strtok(output, "\n");
@@ -665,49 +654,37 @@ int PLAT_bluetoothPaired(struct BT_devicePaired* paired, int max) {
 		char name[249] = {0};
 
 		// Parse "Device XX:XX:XX:XX:XX:XX Name"
-		if (strncmp(line, "Device ", 7) == 0) {
-			if (sscanf(line, "Device %17s", addr) == 1) {
-				// Get name (everything after the address). "Device " (7) +
-				// "XX:XX:XX:XX:XX:XX " (18) = 25 bytes precede the name;
-				// bounds-check so a line with no trailing space can't over-read.
-				if (strlen(line) >= 25) {
-					char* name_start = line + 7 + 18;
-					if (*name_start) {
-						strncpy(name, name_start, sizeof(name) - 1);
-					}
+		if (BtAddr_parseDeviceLine(line, addr, name, sizeof(name))) {
+			// Skip if already in the list (device may be both paired and connected)
+			int duplicate = 0;
+			for (int i = 0; i < count; i++) {
+				if (strcmp(paired[i].remote_addr, addr) == 0) {
+					duplicate = 1;
+					break;
 				}
-
-				// Skip if already in the list (device may be both paired and connected)
-				int duplicate = 0;
-				for (int i = 0; i < count; i++) {
-					if (strcmp(paired[i].remote_addr, addr) == 0) {
-						duplicate = 1;
-						break;
-					}
-				}
-				if (duplicate) {
-					line = strtok(NULL, "\n");
-					continue;
-				}
-
-				struct BT_devicePaired* device = &paired[count];
-				strncpy(device->remote_addr, addr, sizeof(device->remote_addr) - 1);
-				device->remote_addr[sizeof(device->remote_addr) - 1] = '\0';
-				strncpy(device->remote_name, name, sizeof(device->remote_name) - 1);
-				device->remote_name[sizeof(device->remote_name) - 1] = '\0';
-				device->is_bonded = true;
-				device->rssi = -50; // Default value, actual RSSI requires active connection
-
-				// Check if connected
-				char cmd[256];
-				char info_output[1024];
-				snprintf(cmd, sizeof(cmd), "bluetoothctl info %s 2>/dev/null | grep 'Connected: yes'", addr);
-				device->is_connected = (bt_run_cmd(cmd, info_output, sizeof(info_output)) == 0 &&
-										strstr(info_output, "Connected: yes") != NULL);
-
-				btlog("Paired device: %s (%s) connected=%d\n", device->remote_addr, device->remote_name, device->is_connected);
-				count++;
 			}
+			if (duplicate) {
+				line = strtok(NULL, "\n");
+				continue;
+			}
+
+			struct BT_devicePaired* device = &paired[count];
+			strncpy(device->remote_addr, addr, sizeof(device->remote_addr) - 1);
+			device->remote_addr[sizeof(device->remote_addr) - 1] = '\0';
+			strncpy(device->remote_name, name, sizeof(device->remote_name) - 1);
+			device->remote_name[sizeof(device->remote_name) - 1] = '\0';
+			device->is_bonded = true;
+			device->rssi = -50; // Default value, actual RSSI requires active connection
+
+			// Check if connected
+			char cmd[256];
+			char info_output[1024];
+			snprintf(cmd, sizeof(cmd), "bluetoothctl info %s 2>/dev/null | grep 'Connected: yes'", addr);
+			device->is_connected = (bt_run_cmd(cmd, info_output, sizeof(info_output)) == 0 &&
+									strstr(info_output, "Connected: yes") != NULL);
+
+			btlog("Paired device: %s (%s) connected=%d\n", device->remote_addr, device->remote_name, device->is_connected);
+			count++;
 		}
 		line = strtok(NULL, "\n");
 	}
@@ -716,6 +693,8 @@ int PLAT_bluetoothPaired(struct BT_devicePaired* paired, int max) {
 }
 
 void PLAT_bluetoothPair(char* addr) {
+	if (!BtAddr_isValid(addr)) // goes into shell command lines
+		return;
 	btlog("Pairing with %s\n", addr);
 
 	char cmd[256];
@@ -740,6 +719,8 @@ void PLAT_bluetoothPair(char* addr) {
 }
 
 void PLAT_bluetoothUnpair(char* addr) {
+	if (!BtAddr_isValid(addr)) // goes into shell command lines
+		return;
 	btlog("Unpairing %s\n", addr);
 
 	char cmd[256];
@@ -760,6 +741,8 @@ void PLAT_bluetoothUnpair(char* addr) {
 }
 
 void PLAT_bluetoothConnect(char* addr) {
+	if (!BtAddr_isValid(addr)) // goes into shell command lines
+		return;
 	btlog("Connecting to %s\n", addr);
 
 	char cmd[256];
@@ -772,6 +755,8 @@ void PLAT_bluetoothConnect(char* addr) {
 }
 
 void PLAT_bluetoothDisconnect(char* addr) {
+	if (!BtAddr_isValid(addr)) // goes into shell command lines
+		return;
 	btlog("Disconnecting from %s\n", addr);
 
 	char cmd[256];
@@ -829,7 +814,9 @@ void PLAT_bluetoothSetVolume(int vol) {
 
 #define WATCHED_DIR_FMT "%s"
 #define WATCHED_FILE ".asoundrc"
-#define EVENT_BUF_LEN (1024 * (sizeof(struct inotify_event) + NAME_MAX + 1))
+// room for a few events per read (at least one of the largest): the watcher
+// only ever sees a handful, and this buffer lives on the thread's stack
+#define EVENT_BUF_LEN (16 * (sizeof(struct inotify_event) + NAME_MAX + 1))
 
 static pthread_t watcher_thread;
 static int inotify_fd = -1;
@@ -896,7 +883,7 @@ static void remove_file_watch() {
 }
 
 static void* watcher_thread_func(void* arg) {
-	char buffer[EVENT_BUF_LEN];
+	char buffer[EVENT_BUF_LEN] __attribute__((aligned(__alignof__(struct inotify_event))));
 
 	// At start try to watch file if exists
 	add_file_watch();

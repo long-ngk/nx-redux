@@ -1,4 +1,5 @@
 #include "opts_override.h"
+#include "../common/str_trim.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -16,15 +17,6 @@ void opts_snapshot_globals(const EmuOvlConfig* cfg, OptsOverrideState* st) {
 			st->global_value[s][i] = cfg->sections[s].items[i].current_value;
 }
 
-static char* trim(char* s) {
-	while (isspace((unsigned char)*s))
-		s++;
-	char* end = s + strlen(s);
-	while (end > s && isspace((unsigned char)end[-1]))
-		*--end = '\0';
-	return s;
-}
-
 int opts_read_override(EmuOvlConfig* cfg, OptsOverrideState* st, const char* override_path) {
 	if (!cfg || !st || !override_path)
 		return 0;
@@ -35,7 +27,7 @@ int opts_read_override(EmuOvlConfig* cfg, OptsOverrideState* st, const char* ove
 	char section[EMU_OVL_MAX_STR] = "";
 	int applied = 0;
 	while (fgets(line, sizeof(line), f)) {
-		char* p = trim(line);
+		char* p = strTrimSpace(line);
 		if (*p == '\0' || *p == '#' || *p == ';')
 			continue;
 		size_t len = strlen(p);
@@ -48,8 +40,8 @@ int opts_read_override(EmuOvlConfig* cfg, OptsOverrideState* st, const char* ove
 		if (!eq || section[0] == '\0')
 			continue;
 		*eq = '\0';
-		char* key = trim(p);
-		char* val = trim(eq + 1);
+		char* key = strTrimSpace(p);
+		char* val = strTrimSpace(eq + 1);
 		int s = -1, i = -1;
 		EmuOvlItem* item = emu_ovl_cfg_find_item(cfg, section, key, &s, &i);
 		if (!item)
@@ -79,7 +71,13 @@ int opts_write_override(EmuOvlConfig* cfg, const OptsOverrideState* st, const ch
 		unlink(override_path);
 		return 0;
 	}
-	FILE* f = fopen(override_path, "w");
+	// staged in a sibling .tmp and renamed over the override once complete and
+	// synced: a power cut or a full card mid-write keeps the old override
+	// instead of leaving it empty or cut short
+	char tmp[1024 + 8];
+	if (snprintf(tmp, sizeof(tmp), "%s.tmp", override_path) >= (int)sizeof(tmp))
+		return -1;
+	FILE* f = fopen(tmp, "w");
 	if (!f)
 		return -1;
 	// group by resolved ini_section name, first-seen order, no duplicates
@@ -123,7 +121,13 @@ int opts_write_override(EmuOvlConfig* cfg, const OptsOverrideState* st, const ch
 		}
 		fprintf(f, "\n");
 	}
-	fclose(f);
+	int ok = !ferror(f) && fflush(f) == 0 && fsync(fileno(f)) == 0;
+	if (fclose(f) != 0)
+		ok = 0;
+	if (!ok || rename(tmp, override_path) != 0) {
+		unlink(tmp);
+		return -1;
+	}
 	sync();
 	return written;
 }

@@ -3,16 +3,44 @@
 #include "config.h"
 #include "ma_saves.h"
 #include "ma_save_paths.h"
+#include "ma_state_read.h"
 #include "notification.h"
 #include "ra_integration.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <string.h>
+#include <unistd.h>
 #include "ma_rewind.h"
 #include "ma_emutime.h"
-#ifdef HAS_SRM
 #include "streams/rzip_stream.h"
 #include "streams/file_stream.h"
-#endif
+
+// Saves, RTC data and states are staged to a sibling .tmp, fsynced and renamed
+// over the old file, so a full card, a power cut or a kill mid-write keeps the
+// previous save instead of leaving it empty or cut short. Returns 1 on success.
+static int writeSaveFile(const char* path, const void* data, size_t size, int compressed) {
+	if (!data)
+		return 0;
+	if (compressed) {
+		char tmp[MAX_PATH + 16];
+		snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+		int ok = rzipstream_write_file(tmp, data, size);
+		if (ok) {
+			// rzipstream closes without syncing; flush the data before the
+			// rename makes it the live file
+			int fd = open(tmp, O_RDONLY);
+			ok = fd >= 0 && fsync(fd) == 0;
+			if (fd >= 0)
+				close(fd);
+		}
+		if (!ok || rename(tmp, path) != 0) {
+			remove(tmp);
+			return 0;
+		}
+		return 1;
+	}
+	return writeFileAtomic(path, (const char*)data, size);
+}
 
 // filename must be a MAX_PATH-sized buffer
 static void formatSavePath(char* work_name, char* filename, const char* suffix) {
@@ -45,7 +73,6 @@ void SRAM_read(void) {
 
 	void* sram = core.get_memory_data(RETRO_MEMORY_SAVE_RAM);
 
-#ifdef HAS_SRM
 	// Always read through rzipstream, regardless of the save-format setting: it
 	// detects the #RZIPv# magic and falls back to a raw read when absent, so it
 	// handles both compressed and uncompressed .srm files. Choosing the reader
@@ -62,15 +89,6 @@ void SRAM_read(void) {
 		LOG_error("rzipstream: Error reading SRAM data\n");
 
 	rzipstream_close(sram_file);
-#else
-	FILE* sram_file = fopen(filename, "r");
-	if (!sram_file)
-		return;
-	if (!sram || !fread(sram, 1, sram_size, sram_file)) {
-		LOG_error("Error reading SRAM data\n");
-	}
-	fclose(sram_file);
-#endif
 }
 
 void SRAM_write(void) {
@@ -84,26 +102,9 @@ void SRAM_write(void) {
 
 	void* sram = core.get_memory_data(RETRO_MEMORY_SAVE_RAM);
 
-#ifdef HAS_SRM
-	// srm, compressed
-	if (CFG_getSaveFormat() == SAVE_FORMAT_SRM) {
-		if (!rzipstream_write_file(filename, sram, sram_size))
-			LOG_error("rzipstream: Error writing SRAM data to file\n");
-	} else {
-		if (!filestream_write_file(filename, sram, sram_size))
-			LOG_error("filestream: Error writing SRAM data to file\n");
-	}
-#else
-	FILE* sram_file = fopen(filename, "w");
-	if (!sram_file) {
-		LOG_error("Error opening SRAM file: %s\n", strerror(errno));
-		return;
-	}
-	if (!sram || sram_size != fwrite(sram, 1, sram_size, sram_file)) {
-		LOG_error("Error writing SRAM data to file\n");
-	}
-	fclose(sram_file);
-#endif
+	// srm is compressed; the other formats are raw
+	if (!writeSaveFile(filename, sram, sram_size, CFG_getSaveFormat() == SAVE_FORMAT_SRM))
+		LOG_error("Error writing SRAM data to file: %s (%s)\n", filename, strerror(errno));
 	sync();
 }
 
@@ -142,19 +143,9 @@ void RTC_write(void) {
 	RTC_getPath(filename);
 	printf("rtc path (write) size(%zu): %s\n", rtc_size, filename);
 
-	FILE* rtc_file = fopen(filename, "w");
-	if (!rtc_file) {
-		LOG_error("Error opening RTC file: %s\n", strerror(errno));
-		return;
-	}
-
 	void* rtc = core.get_memory_data(RETRO_MEMORY_RTC);
-
-	if (!rtc || rtc_size != fwrite(rtc, 1, rtc_size, rtc_file)) {
-		LOG_error("Error writing RTC data to file\n");
-	}
-
-	fclose(rtc_file);
+	if (!writeSaveFile(filename, rtc, rtc_size, 0))
+		LOG_error("Error writing RTC data to file: %s (%s)\n", filename, strerror(errno));
 
 	sync();
 }
@@ -173,72 +164,8 @@ void State_getPath(char* filename) {
 	State_getSlotPath(state_slot, filename);
 }
 
-#define RASTATE_HEADER_SIZE 16
-#define STATE_READ_MAX (256u << 20)
-
-typedef int64_t (*StateReadFn)(void* stream, void* buf, size_t len);
-
-#ifdef HAS_SRM
 static int64_t State_readRz(void* stream, void* buf, size_t len) {
 	return rzipstream_read((rzipstream_t*)stream, buf, len);
-}
-#else
-static int64_t State_readFile(void* stream, void* buf, size_t len) {
-	size_t n = fread(buf, 1, len, (FILE*)stream);
-	return (n == 0 && ferror((FILE*)stream)) ? -1 : (int64_t)n;
-}
-#endif
-
-// The size of a RASTATE file's MEM block (header "RASTATE<ver>MEM <le32>"), 0 for raw core data.
-static size_t State_memSize(const uint8_t* header) {
-	if (memcmp(header, "RASTATE", 7) != 0 || memcmp(header + 8, "MEM ", 4) != 0)
-		return 0;
-	return (size_t)header[12] | (size_t)header[13] << 8 | (size_t)header[14] << 16 | (size_t)header[15] << 24;
-}
-
-// Reads the state data: [want] bytes when known, else to the end. The buffer is at least
-// [min_size] (the core's serialize_size, zero-filled past the data) but grows past it: a
-// core's live size can be smaller than a state it wrote later in a game (flycast includes
-// its render lists, ~27 MB after boot and ~36 MB mid-game), and unserialize rejects data
-// cut to the smaller size. *out_size is what to pass to unserialize: max(data, min_size).
-static void* State_readData(StateReadFn rd, void* stream, size_t min_size, size_t want, size_t* out_size) {
-	size_t cap = want > min_size ? want : min_size;
-	if (cap > STATE_READ_MAX)
-		return NULL;
-	uint8_t* buf = calloc(1, cap);
-	if (!buf)
-		return NULL;
-	size_t len = 0;
-	while (!want || len < want) {
-		if (len == cap) {
-			size_t grown = cap * 2;
-			if (grown > STATE_READ_MAX) {
-				free(buf);
-				return NULL;
-			}
-			uint8_t* next = realloc(buf, grown);
-			if (!next) {
-				free(buf);
-				return NULL;
-			}
-			memset(next + cap, 0, grown - cap);
-			buf = next;
-			cap = grown;
-		}
-		size_t ask = cap - len;
-		if (want && ask > want - len)
-			ask = want - len;
-		int64_t n = rd(stream, buf + len, ask);
-		if (n < 0) {
-			free(buf);
-			return NULL;
-		}
-		if (n == 0)
-			break;
-		len += (size_t)n;
-	}
-	*out_size = len > min_size ? len : min_size;
-	return buf;
 }
 
 // The whole state first; a core that wants exactly its serialize_size (and refuses a longer
@@ -271,16 +198,11 @@ int State_read(void) { // from picoarch
 
 	// declared (and initialized) before the first goto so the error paths
 	// never see an indeterminate handle
-#ifdef HAS_SRM
 	rzipstream_t* state_rzfile = NULL;
-#else
-	FILE* state_file = NULL;
-#endif
 
 	void* state = NULL;
 	size_t data_size = 0;
 
-#ifdef HAS_SRM
 	state_rzfile = rzipstream_open(filename, RETRO_VFS_FILE_ACCESS_READ);
 	if (!state_rzfile) {
 		if (state_slot != RESUME_SLOT_DEFAULT) { // default state in MiniUI, may not exist
@@ -320,46 +242,6 @@ error:
 		free(state);
 	if (state_rzfile)
 		rzipstream_close(state_rzfile);
-#else
-	state_file = fopen(filename, "r");
-	if (!state_file) {
-		if (state_slot != RESUME_SLOT_DEFAULT) { // default state in MiniUI, may not exist
-			LOG_error("Error opening state file: %s (%s)\n", filename, strerror(errno));
-		}
-		goto error;
-	}
-
-	if (fread(rastate_header, 1, RASTATE_HEADER_SIZE, state_file) < RASTATE_HEADER_SIZE) {
-		LOG_error("Error reading rastate header from file: %s (%s)\n", filename, strerror(errno));
-		goto error;
-	}
-
-	if (memcmp(rastate_header, "RASTATE", 7) != 0) {
-		// This file only contains raw core state data; rewind
-		fseek(state_file, 0, SEEK_SET);
-	}
-
-	// some cores report the wrong serialize size initially for some games, eg. mgba: Wario Land 4,
-	// so a shorter state is padded to state_size, and a longer one is read whole
-	state = State_readData(State_readFile, state_file, state_size, State_memSize(rastate_header), &data_size);
-	if (!state) {
-		LOG_error("Error reading state data from file: %s (%s)\n", filename, strerror(errno));
-		goto error;
-	}
-
-	if (!State_unserialize(state, data_size, state_size)) {
-		LOG_error("Error restoring save state: %s\n", filename);
-		goto error;
-	}
-	success = 1;
-	EmuTime_reset(); // the loaded state starts a new emulated timeline
-
-error:
-	if (state)
-		free(state);
-	if (state_file)
-		fclose(state_file);
-#endif
 	fast_forward = was_ff;
 	return success;
 }
@@ -382,12 +264,6 @@ int State_write(void) { // from picoarch
 	char filename[MAX_PATH];
 	State_getPath(filename);
 
-	// declared (and initialized) before the first goto so the error paths
-	// never see an indeterminate handle
-#ifndef HAS_SRM
-	FILE* state_file = NULL;
-#endif
-
 	void* state = calloc(1, state_size);
 	if (!state) {
 		LOG_error("Couldn't allocate memory for state\n");
@@ -399,41 +275,16 @@ int State_write(void) { // from picoarch
 		goto error;
 	}
 
-#ifdef HAS_SRM
-	if (CFG_getStateFormat() == STATE_FORMAT_SRM || CFG_getStateFormat() == STATE_FORMAT_SRM_EXTRADOT) {
-		if (!rzipstream_write_file(filename, state, state_size)) {
-			LOG_error("rzipstream: Error writing state data to file: %s\n", filename);
-			goto error;
-		}
-		success = 1;
-	} else {
-		if (!filestream_write_file(filename, state, state_size)) {
-			LOG_error("filestream: Error writing state data to file: %s\n", filename);
-			goto error;
-		}
-		success = 1;
-	}
-
-error:
-	if (state)
-		free(state);
-#else
-	state_file = fopen(filename, "w");
-	if (!state_file) {
-		LOG_error("Error opening state file: %s (%s)\n", filename, strerror(errno));
-		goto error;
-	}
-	if (state_size != fwrite(state, 1, state_size, state_file)) {
+	if (!writeSaveFile(filename, state, state_size,
+					   CFG_getStateFormat() == STATE_FORMAT_SRM || CFG_getStateFormat() == STATE_FORMAT_SRM_EXTRADOT)) {
 		LOG_error("Error writing state data to file: %s (%s)\n", filename, strerror(errno));
 		goto error;
 	}
 	success = 1;
+
 error:
 	if (state)
 		free(state);
-	if (state_file)
-		fclose(state_file);
-#endif
 
 	sync();
 	fast_forward = was_ff;

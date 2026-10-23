@@ -7,6 +7,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
 
 // The USB cable link (usblink.elf) is the /30 10.99.0.0: host 10.99.0.1,
 // device 10.99.0.2.
@@ -127,6 +128,11 @@ bool sync_is_roms_phase(int phase);
 #define SYNC_BIOS_EXCLUDE_PATTERN "vmu_save_*.bin"
 #define SYNC_BIOS_ARGS "--ignore-existing --exclude='" SYNC_BIOS_EXCLUDE_PATTERN "'"
 
+// Every transfer gives up when the peer goes quiet (Wi-Fi dropped, cable
+// pulled, the other device slept): 15 s to reach its daemon, then 60 s
+// without any data moving. Otherwise the sync thread waits on rsync forever.
+#define SYNC_RSYNC_TIMEOUT_ARGS "--timeout=60 --contimeout=15"
+
 // Collections (Collections/<Name>.txt, one SD-relative game path per line)
 // merge on every sync: each device keeps its lines in order and gains the
 // other's lines it lacks, in the other's order. Nothing is ever removed.
@@ -137,9 +143,15 @@ bool sync_is_roms_phase(int phase);
 // The pull takes top-level *.txt files only (no folders, no alias map in any
 // case). The daemon's [collections] keeps the alias map out for every client.
 #define SYNC_COLLECTIONS_RSYNC_OPTS \
-	"-rtv --no-perms --omit-dir-times --modify-window=1 --info=progress2 " SYNC_JUNK_CLIENT_ARGS
+	"-rtv --no-perms --omit-dir-times --modify-window=1 --info=progress2 " SYNC_RSYNC_TIMEOUT_ARGS " " SYNC_JUNK_CLIENT_ARGS
 #define SYNC_MAP_PATTERN "/[mM][aA][pP].[tT][xX][tT]"
 #define SYNC_COLLECTIONS_PULL_ARGS "--exclude='" SYNC_MAP_PATTERN "' --exclude='*/' --include='/*.[tT][xX][tT]' --exclude='*'"
+
+// A collection is read whole into RAM and merged line by line against the
+// other side, so a bigger file (some 10,000 game paths) is left as it is on
+// both devices. The pull still takes it: one skipped by the pull (--max-size)
+// would look absent there, and this device's copy would be pushed over it.
+#define SYNC_COLLECTION_MAX_BYTES (1024 * 1024)
 #define SYNC_COLLECTIONS_DAEMON_EXCLUDE SYNC_MAP_PATTERN
 
 // A collection file: "<Name>.txt" (extension in any case, as the launcher
@@ -150,6 +162,11 @@ bool sync_is_collection_name(const char* name);
 // A file's lines: split on \n, one trailing \r trimmed from each; a final
 // newline makes no extra empty line. False when out of memory.
 bool sync_text_lines(const char* text, size_t len, SyncNames* out);
+
+// Reads all of fp into a malloc'd *buf (NUL-terminated, *len bytes before
+// the NUL). Returns 0, 1 when it holds more than max bytes (nothing kept), or
+// -1 on a read error or out of memory.
+int sync_read_capped(FILE* fp, size_t max, char** buf, size_t* len);
 
 // False when text holds a NUL byte: its lines can't be kept whole, so such a
 // file is left as it is.
@@ -176,5 +193,17 @@ bool sync_phase_skippable(int phase, int exit_code, bool unknown_module);
 // rsyncd.conf filter value ("- /music-player/ + ..."). -1 when out is too small.
 int sync_shared_client_args(char* out, size_t size);
 int sync_shared_daemon_filter(char* out, size_t size);
+
+// One rsync --info=progress2 line: "xfr#N" sets *transferred (SYNC_PROGRESS_XFR in the result),
+// "to-chk=X/Y" (or older rsync's "to-check=") with Y > 0 sets *total = Y and *done = Y - X
+// (SYNC_PROGRESS_CHK). Outputs not named in the result are left as they were.
+#define SYNC_PROGRESS_XFR 1
+#define SYNC_PROGRESS_CHK 2
+int sync_parse_progress2(const char* line, int* transferred, int* done, int* total);
+
+// One line from rsync's output, ended by \r (progress2 redraws in place) or \n. Leading line
+// breaks are skipped, so empty lines never come back; a line longer than size - 1 comes back in
+// pieces. NULL at EOF with nothing read.
+char* sync_read_line_cr(char* buf, int size, FILE* fp);
 
 #endif
