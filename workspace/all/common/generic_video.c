@@ -28,6 +28,8 @@
 #include <sys/mman.h>
 #include <sys/file.h>
 #include "shader_strip.h"
+#include <linux/fb.h>
+#include <sys/ioctl.h>
 
 static void bandShadowInvalidate(void);
 
@@ -953,6 +955,72 @@ void PLAT_resetShaders() {
 	shaderResetRequested = 1;
 }
 
+// Shown by PLAT_clearAll's flips instead of black while set (minarch: the
+// resume state's screenshot, so the screen goes from the menu to the paused
+// game to the running game without a black frame).
+static SDL_Surface* clear_image = NULL;
+void PLAT_setClearImage(SDL_Surface* image) {
+	clear_image = image;
+}
+// While set, PLAT_GL_Swap shows nothing new: the clear image stays up over a
+// core's frames (minarch: a resume mupen64plus-next only takes once its
+// emulation runs, whose first frames are the game booting from scratch)
+static bool hold_frames = false;
+void PLAT_holdFrames(bool hold) {
+	hold_frames = hold;
+}
+void PLAT_drawClearImage(SDL_Surface* screen) {
+	if (clear_image)
+		SDL_BlitScaled(clear_image, NULL, screen, NULL);
+}
+
+#ifndef SDL_VIDEO_DRIVER_KMSDRM
+// fbdev (tg5040), where the framebuffer is what the panel shows: creating the
+// window clears both pages EGL flips between (a band sweeping over the picture
+// for a frame), and the renderer takes another ~130 ms before anything can be
+// presented. Writes the clear image into the framebuffer's last page, which
+// EGL never uses, and pans the display there; the first present pans back to
+// EGL's own pages. False when nothing was done. On DRM (tg5050) fb0 is not
+// scanned out: not built there.
+static bool fbShowClearImage(void) {
+	int fd = open("/dev/fb0", O_RDWR);
+	if (fd < 0)
+		return false;
+	struct fb_var_screeninfo vi;
+	struct fb_fix_screeninfo fi;
+	if (ioctl(fd, FBIOGET_VSCREENINFO, &vi) || ioctl(fd, FBIOGET_FSCREENINFO, &fi) || vi.bits_per_pixel != 32 || !vi.yres) {
+		close(fd);
+		return false;
+	}
+	size_t len = (size_t)vi.yres * fi.line_length;
+	int page = (int)(fi.smem_len / len) - 1; // past the two EGL flips between
+	size_t off = (size_t)page * len;
+	if (page < 2 || (unsigned)((page + 1) * vi.yres) > vi.yres_virtual || off % sysconf(_SC_PAGESIZE)) {
+		close(fd);
+		return false;
+	}
+	void* fb = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, off);
+	if (fb == MAP_FAILED) {
+		close(fd);
+		return false;
+	}
+	Uint32 rmask = ((1u << vi.red.length) - 1) << vi.red.offset;
+	Uint32 gmask = ((1u << vi.green.length) - 1) << vi.green.offset;
+	Uint32 bmask = ((1u << vi.blue.length) - 1) << vi.blue.offset;
+	Uint32 amask = vi.transp.length ? ((1u << vi.transp.length) - 1) << vi.transp.offset : 0;
+	SDL_Surface* dst = SDL_CreateRGBSurfaceFrom(fb, vi.xres, vi.yres, 32, fi.line_length, rmask, gmask, bmask, amask);
+	if (dst) {
+		SDL_BlitScaled(clear_image, NULL, dst, NULL);
+		SDL_FreeSurface(dst);
+	}
+	munmap(fb, len);
+	vi.yoffset = page * vi.yres;
+	bool panned = ioctl(fd, FBIOPAN_DISPLAY, &vi) == 0;
+	close(fd);
+	return panned;
+}
+#endif
+
 SDL_Surface* PLAT_initVideo(void) {
 #if NEXTUI_TSAN
 	/*
@@ -975,6 +1043,10 @@ SDL_Surface* PLAT_initVideo(void) {
 	SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
 	SDL_SetHint(SDL_HINT_FRAMEBUFFER_ACCELERATION, "1");
 
+#ifndef SDL_VIDEO_DRIVER_KMSDRM
+	if (clear_image)
+		fbShowClearImage(); // on a page the window does not clear, see there
+#endif
 	vid.window = SDL_CreateWindow("", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, w, h, SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN);
 	if (vid.window) {
 		vid.renderer = SDL_CreateRenderer(vid.window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
@@ -1067,6 +1139,14 @@ SDL_Surface* PLAT_initVideo(void) {
 	device_pitch = p;
 
 	vid.sharpness = SHARPNESS_SOFT;
+
+	// creating the window blanked the screen: put the clear image up now,
+	// not after the fonts and assets load
+	if (clear_image) {
+		PLAT_clearLayers(0); // new layer textures hold whatever was in that memory
+		PLAT_drawClearImage(vid.screen);
+		PLAT_flip(vid.screen, 0);
+	}
 
 	return vid.screen;
 }
@@ -1177,6 +1257,91 @@ void PLAT_setShaders(int nr) {
 	reloadShaderTextures = 1;
 }
 
+#ifdef SDL_VIDEO_DRIVER_KMSDRM
+#include <SDL2/SDL_syswm.h>
+#include <drm/drm.h>
+#include <drm/drm_mode.h>
+#include <sys/wait.h>
+#include <time.h>
+#endif
+
+// On DRM (tg5050) the kernel turns the screen off when the last handle to
+// the displayed framebuffer closes, so when nextui exits the screen stays
+// black until minarch's first frame (~0.6 s). Instead nextui gives up display
+// control and leaves a child holding its DRM file, which keeps this frame on
+// screen until another framebuffer replaces it (minarch's first present) or
+// HOLD_DISPLAY_MAX_MS passes. Only async-signal-safe calls after the fork.
+// False (nothing done) without KMSDRM; the caller then quits as usual.
+#define HOLD_DISPLAY_MAX_MS 8000
+bool PLAT_holdDisplayOnExit(void) {
+#ifdef SDL_VIDEO_DRIVER_KMSDRM
+	SDL_SysWMinfo info;
+	SDL_VERSION(&info.version);
+	if (!vid.window || !SDL_GetWindowWMInfo(vid.window, &info) || info.subsystem != SDL_SYSWM_KMSDRM)
+		return false;
+	int fd = info.info.kmsdrm.drm_fd;
+	if (fd < 0)
+		return false;
+
+	// the CRTC showing this frame, and the framebuffer it shows
+	uint32_t crtc_ids[8] = {0};
+	struct drm_mode_card_res res;
+	memset(&res, 0, sizeof(res));
+	if (ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res) != 0)
+		return false;
+	res.count_fbs = res.count_connectors = res.count_encoders = 0;
+	if (res.count_crtcs > 8)
+		res.count_crtcs = 8;
+	res.crtc_id_ptr = (uintptr_t)crtc_ids;
+	if (ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res) != 0)
+		return false;
+	uint32_t crtc = 0, fb = 0;
+	for (unsigned i = 0; i < res.count_crtcs && !fb; i++) {
+		struct drm_mode_crtc cr;
+		memset(&cr, 0, sizeof(cr));
+		cr.crtc_id = crtc_ids[i];
+		if (ioctl(fd, DRM_IOCTL_MODE_GETCRTC, &cr) == 0 && cr.mode_valid && cr.fb_id)
+			crtc = cr.crtc_id, fb = cr.fb_id;
+	}
+	if (!fb)
+		return false;
+
+	// the next app becomes master when it opens the device
+	if (ioctl(fd, DRM_IOCTL_DROP_MASTER, 0) != 0)
+		return false;
+
+	pid_t pid = fork();
+	if (pid < 0)
+		return false;
+	if (pid > 0)
+		return true;
+
+	// child: keep only the DRM file, wait for another framebuffer on the CRTC
+	setsid();
+	for (int i = 0; i < 1024; i++)
+		if (i != fd)
+			close(i);
+	struct timespec tick = {0, 5 * 1000 * 1000};
+	for (int waited = 0; waited < HOLD_DISPLAY_MAX_MS; waited += 5) {
+		struct drm_mode_crtc cr;
+		memset(&cr, 0, sizeof(cr));
+		cr.crtc_id = crtc;
+		if (ioctl(fd, DRM_IOCTL_MODE_GETCRTC, &cr) != 0 || cr.fb_id != fb)
+			break;
+		nanosleep(&tick, NULL);
+	}
+	_exit(0);
+#else
+	return false;
+#endif
+}
+
+// PLAT_keepScreenOnQuit: the app that comes next draws over this frame itself
+static bool keep_screen_on_quit = false;
+void PLAT_keepScreenOnQuit(void) {
+	keep_screen_on_quit = true;
+}
+
 static void clearVideo(void) {
 	SDL_FillRect(vid.screen, NULL, SDL_transparentBlack);
 	SDL_UpdateTexture(vid.stream_layer1, NULL, vid.screen->pixels, vid.screen->pitch);
@@ -1234,7 +1399,8 @@ void PLAT_quitVideo(void) {
 	}
 	capture_active = false;
 
-	clearVideo();
+	if (!keep_screen_on_quit)
+		clearVideo();
 
 	// Make sure the GL context is current before tearing down textures/renderer
 	SDL_GL_MakeCurrent(vid.window, vid.gl_context);
@@ -1291,6 +1457,7 @@ void PLAT_clearAll(void) {
 	// ok honestely mixing SDL and OpenGL is really bad, but hey it works just got to sometimes clear gpu stuff and pull context back to SDL
 	// so yeah clear all layers and pull a flip() to make it switch back to SDL before clearing
 	PLAT_clearLayers(0);
+	PLAT_drawClearImage(vid.screen);
 	PLAT_flip(vid.screen, 0);
 	PLAT_clearLayers(0);
 	PLAT_flip(vid.screen, 0);
@@ -3187,101 +3354,106 @@ typedef struct {
 
 static FramePreparation frame_prep = {0};
 
-int prepareFrameThread(void* data) {
-	PWR_pinHelperThread();
-	while (1) {
-		updateEffect();
+// One pass of the effect/overlay loading: PrepareFrameThread's loop, and once
+// on the main thread before the first frame so that frame already has them.
+static void prepareFrame(void) {
+	updateEffect();
 
-		// Check effectUpdated flag with mutex
-		pthread_mutex_lock(&video_prep_mutex);
-		int effect_updated = effectUpdated;
-		pthread_mutex_unlock(&video_prep_mutex);
+	// Check effectUpdated flag with mutex
+	pthread_mutex_lock(&video_prep_mutex);
+	int effect_updated = effectUpdated;
+	pthread_mutex_unlock(&video_prep_mutex);
 
-		if (effect_updated) {
-			LOG_info("effect updated %s\n", effect_path);
-			if (effect_path) {
-				SDL_Surface* tmp = IMG_Load(effect_path);
-				SDL_Surface* converted = NULL;
-				if (tmp) {
-					converted = SDL_ConvertSurfaceFormat(tmp, SDL_PIXELFORMAT_RGBA32, 0);
-					SDL_FreeSurface(tmp);
-				}
-
-				pthread_mutex_lock(&video_prep_mutex);
-				SDL_Surface* old = frame_prep.loaded_effect;
-				frame_prep.loaded_effect = converted;
-				effectUpdated = 0;
-				frame_prep.effect_ready = 1;
-				pthread_mutex_unlock(&video_prep_mutex);
-				// PLAT_GL_Swap only touches loaded_* while holding the mutex
-				SDL_FreeSurface(old);
-			} else {
-				pthread_mutex_lock(&video_prep_mutex);
-				SDL_Surface* old = frame_prep.loaded_effect;
-				frame_prep.loaded_effect = 0;
-				effectUpdated = 0;
-				frame_prep.effect_ready = 1;
-				pthread_mutex_unlock(&video_prep_mutex);
-				SDL_FreeSurface(old);
+	if (effect_updated) {
+		LOG_info("effect updated %s\n", effect_path);
+		if (effect_path) {
+			SDL_Surface* tmp = IMG_Load(effect_path);
+			SDL_Surface* converted = NULL;
+			if (tmp) {
+				converted = SDL_ConvertSurfaceFormat(tmp, SDL_PIXELFORMAT_RGBA32, 0);
+				SDL_FreeSurface(tmp);
 			}
-		}
 
-		// Check if effect is disabled
-		pthread_mutex_lock(&video_prep_mutex);
-		int effect_type = effect.type;
-		SDL_Surface* loaded_effect = frame_prep.loaded_effect;
-		pthread_mutex_unlock(&video_prep_mutex);
-
-		if (effect_type == EFFECT_NONE && loaded_effect != 0) {
+			pthread_mutex_lock(&video_prep_mutex);
+			SDL_Surface* old = frame_prep.loaded_effect;
+			frame_prep.loaded_effect = converted;
+			effectUpdated = 0;
+			frame_prep.effect_ready = 1;
+			pthread_mutex_unlock(&video_prep_mutex);
+			// PLAT_GL_Swap only touches loaded_* while holding the mutex
+			SDL_FreeSurface(old);
+		} else {
 			pthread_mutex_lock(&video_prep_mutex);
 			SDL_Surface* old = frame_prep.loaded_effect;
 			frame_prep.loaded_effect = 0;
+			effectUpdated = 0;
 			frame_prep.effect_ready = 1;
 			pthread_mutex_unlock(&video_prep_mutex);
 			SDL_FreeSurface(old);
 		}
+	}
 
-		// Check overlayUpdated flag with mutex
+	// Check if effect is disabled
+	pthread_mutex_lock(&video_prep_mutex);
+	int effect_type = effect.type;
+	SDL_Surface* loaded_effect = frame_prep.loaded_effect;
+	pthread_mutex_unlock(&video_prep_mutex);
+
+	if (effect_type == EFFECT_NONE && loaded_effect != 0) {
 		pthread_mutex_lock(&video_prep_mutex);
-		int overlay_updated = overlayUpdated;
+		SDL_Surface* old = frame_prep.loaded_effect;
+		frame_prep.loaded_effect = 0;
+		frame_prep.effect_ready = 1;
 		pthread_mutex_unlock(&video_prep_mutex);
+		SDL_FreeSurface(old);
+	}
 
-		if (overlay_updated) {
-			LOG_info("overlay updated\n");
-			// Copy the path: PLAT_setOverlay may replace it on the main thread
-			// while IMG_Load runs.
-			char path[MAX_PATH];
-			pthread_mutex_lock(&video_prep_mutex);
-			int have_path = overlay_path != NULL;
-			if (have_path)
-				snprintf(path, sizeof(path), "%s", overlay_path);
-			pthread_mutex_unlock(&video_prep_mutex);
-			if (have_path) {
-				SDL_Surface* tmp = path[0] ? IMG_Load(path) : NULL;
-				SDL_Surface* converted = NULL;
-				if (tmp) {
-					converted = SDL_ConvertSurfaceFormat(tmp, SDL_PIXELFORMAT_RGBA32, 0);
-					SDL_FreeSurface(tmp);
-				}
+	// Check overlayUpdated flag with mutex
+	pthread_mutex_lock(&video_prep_mutex);
+	int overlay_updated = overlayUpdated;
+	pthread_mutex_unlock(&video_prep_mutex);
 
-				pthread_mutex_lock(&video_prep_mutex);
-				SDL_Surface* old = frame_prep.loaded_overlay;
-				frame_prep.loaded_overlay = converted;
-				frame_prep.overlay_ready = 1;
-				overlayUpdated = 0;
-				pthread_mutex_unlock(&video_prep_mutex);
-				SDL_FreeSurface(old);
-			} else {
-				pthread_mutex_lock(&video_prep_mutex);
-				SDL_Surface* old = frame_prep.loaded_overlay;
-				frame_prep.loaded_overlay = 0;
-				frame_prep.overlay_ready = 1;
-				overlayUpdated = 0;
-				pthread_mutex_unlock(&video_prep_mutex);
-				SDL_FreeSurface(old);
+	if (overlay_updated) {
+		LOG_info("overlay updated\n");
+		// Copy the path: PLAT_setOverlay may replace it on the main thread
+		// while IMG_Load runs.
+		char path[MAX_PATH];
+		pthread_mutex_lock(&video_prep_mutex);
+		int have_path = overlay_path != NULL;
+		if (have_path)
+			snprintf(path, sizeof(path), "%s", overlay_path);
+		pthread_mutex_unlock(&video_prep_mutex);
+		if (have_path) {
+			SDL_Surface* tmp = path[0] ? IMG_Load(path) : NULL;
+			SDL_Surface* converted = NULL;
+			if (tmp) {
+				converted = SDL_ConvertSurfaceFormat(tmp, SDL_PIXELFORMAT_RGBA32, 0);
+				SDL_FreeSurface(tmp);
 			}
-		}
 
+			pthread_mutex_lock(&video_prep_mutex);
+			SDL_Surface* old = frame_prep.loaded_overlay;
+			frame_prep.loaded_overlay = converted;
+			frame_prep.overlay_ready = 1;
+			overlayUpdated = 0;
+			pthread_mutex_unlock(&video_prep_mutex);
+			SDL_FreeSurface(old);
+		} else {
+			pthread_mutex_lock(&video_prep_mutex);
+			SDL_Surface* old = frame_prep.loaded_overlay;
+			frame_prep.loaded_overlay = 0;
+			frame_prep.overlay_ready = 1;
+			overlayUpdated = 0;
+			pthread_mutex_unlock(&video_prep_mutex);
+			SDL_FreeSurface(old);
+		}
+	}
+}
+
+int prepareFrameThread(void* data) {
+	PWR_pinHelperThread();
+	while (1) {
+		prepareFrame();
 		SDL_Delay(120);
 	}
 	return 0;
@@ -3290,9 +3462,16 @@ int prepareFrameThread(void* data) {
 static SDL_Thread* prepare_thread = NULL;
 
 void PLAT_GL_Swap() {
+	if (hold_frames) {
+		SDL_Delay(16); // the vsync the skipped swap would have waited for
+		return;
+	}
 	capture_check();
 
 	if (prepare_thread == NULL) {
+		// the first frame waits for the overlay and effect instead of going up
+		// without them (they popped in a few frames later)
+		prepareFrame();
 		prepare_thread = SDL_CreateThread(prepareFrameThread, "PrepareFrameThread", NULL);
 
 		if (prepare_thread == NULL) {
@@ -3301,21 +3480,24 @@ void PLAT_GL_Swap() {
 		}
 	}
 
-	static int lastframecount = 0;
-	if (reloadShaderTextures)
-		lastframecount = frame_count;
-	if (frame_count < lastframecount + 3 || notif.clear_frames > 0) {
-		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-		if (notif.clear_frames > 0)
-			notif.clear_frames--;
-	}
-
-	SDL_Rect dst_rect = {0, 0, device_width, device_height};
-	setRectToAspectRatio(&dst_rect);
+	// Every frame: the game rect leaves the letterbox bars to whatever the buffer
+	// held (a toast, a resume screenshot), which then showed and was captured in
+	// save-state screenshots. On these tile GPUs the clear costs nothing
+	// measurable (Brick FireRed: same frame time and CPU).
+	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+	if (notif.clear_frames > 0)
+		notif.clear_frames--;
 
 	if (!hwr.frame_ready && (!vid.blit || !vid.blit->src)) {
 		return;
 	}
+
+	// vid.blit is gone after the in-game menu: quitting from it captures the
+	// screen through here, and reading it crashed every Save & Quit (before the
+	// RTC write and the core's unload)
+	SDL_Rect dst_rect = {0, 0, device_width, device_height};
+	if (vid.blit)
+		setRectToAspectRatio(&dst_rect);
 
 	SDL_GL_MakeCurrent(vid.window, vid.gl_context);
 

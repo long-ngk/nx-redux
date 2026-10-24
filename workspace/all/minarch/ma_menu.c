@@ -11,6 +11,7 @@
 #include "ui_buttonhintbar.h"
 #include "ui_menubar.h"
 #include "ma_menu.h"
+#include "ma_png.h"
 #include "ma_present.h"
 #include "ma_frontend_opts.h"
 #include "ma_saves.h"
@@ -1323,17 +1324,16 @@ int save_screenshot_thread(void* data) {
 	SDL_Surface* converted = args->surface ? args->surface
 										   : rawCaptureToSurface(args->pixels, args->w, args->h, SDL_PIXELFORMAT_ARGB8888);
 
+	if (converted && converted->format->format != SDL_PIXELFORMAT_ARGB8888) {
+		SDL_Surface* argb = SDL_ConvertSurfaceFormat(converted, SDL_PIXELFORMAT_ARGB8888, 0);
+		SDL_FreeSurface(converted);
+		converted = argb;
+	}
 	if (!converted) {
 		SDL_Log("Failed to convert screenshot surface: %s", SDL_GetError());
-	} else {
-		SDL_RWops* rw = SDL_RWFromFile(args->path, "wb");
-		if (!rw) {
-			SDL_Log("Failed to open file for writing: %s", SDL_GetError());
-		} else {
-			if (IMG_SavePNG_RW(converted, rw, 1) != 0) {
-				SDL_Log("Failed to save PNG: %s", SDL_GetError());
-			}
-		}
+	} else if (PNG_saveRGB(args->path, converted->pixels, converted->w, converted->h, converted->pitch) != 0) {
+		// zlib's fastest level: ~0.15 s for a 1280x720 frame where SDL_image took ~0.8 s (Smart Pro S)
+		SDL_Log("Failed to save PNG: %s", args->path);
 	}
 	SDL_FreeSurface(converted);
 	free(args->path);
@@ -1442,9 +1442,26 @@ static bool Menu_canAutosaveQuit(void) {
 // screenshot and repoints the .minui slot file at it, so RESUME always returns
 // to the exact quit moment (parity with DC.pak's quit behavior). Without this,
 // a bare quit leaves the switcher pointing at a stale (or no) state.
+// Quitting from the menu: the screen as shown stays up while minarch exits
+// and nextui starts on it (HELD_FRAME_PATH), instead of a fade to black. A BMP:
+// encoding the PNG took ~0.3 s.
+static void Menu_holdScreenForQuit(void) {
+	// the display flips between two buffers, the one read back holding the frame
+	// before (the previous item highlighted): show this one in both first
+	GFX_flip(screen);
+	GFX_flip(screen);
+	SDL_Surface* shown = GFX_captureRendererToSurface();
+	if (!shown)
+		return;
+	if (SDL_SaveBMP(shown, HELD_FRAME_BMP) == 0)
+		putFile(HELD_FRAME_PATH, HELD_FRAME_BMP);
+	SDL_FreeSurface(shown);
+}
 static void Menu_autosaveQuit(void) {
 	if (!Menu_canAutosaveQuit())
 		return;
+	// leaving: the menu's low clock would only slow the save and the teardown
+	PWR_setCPUSpeed(CPU_SPEED_PERFORMANCE);
 
 	// disc path marker for multi-disc games, matching Menu_saveState
 	if (menu.total_discs && menu.disc >= 0) {
@@ -1455,13 +1472,12 @@ static void Menu_autosaveQuit(void) {
 	}
 
 	// switcher screenshot for the auto slot; the menu is open, so menu.bitmap
-	// holds the frame the user quit on
+	// holds the frame the user quit on. Encoded in the background (~0.3 s)
+	// while minarch winds down; main waits for it before exiting
 	if (menu.bitmap) {
 		char bmp_path[MAX_PATH];
 		snprintf(bmp_path, sizeof(bmp_path), "%s/%s.%d.bmp", menu.minui_dir, game.name, AUTO_RESUME_SLOT);
-		SDL_RWops* rw = SDL_RWFromFile(bmp_path, "wb");
-		if (rw)
-			IMG_SavePNG_RW(menu.bitmap, rw, 1);
+		Menu_queueSurfaceSave(menu.bitmap, bmp_path);
 	}
 
 	// only repoint RESUME at the auto slot if the state actually wrote —
@@ -1469,6 +1485,10 @@ static void Menu_autosaveQuit(void) {
 	state_slot = AUTO_RESUME_SLOT;
 	if (State_write())
 		putInt(menu.slot_path, AUTO_RESUME_SLOT);
+}
+
+const char* Menu_slotPreviewPath(void) {
+	return menu.bmp_path;
 }
 
 void Menu_saveState(void) {
@@ -1798,6 +1818,7 @@ void Menu_loop(void) {
 				show_menu = 0;
 			} else if (selected == ITEM_QUIT && Menu_canAutosaveQuit()) {
 				// quit without the auto-resume save: RESUME keeps its old point
+				Menu_holdScreenForQuit();
 				Netplay_quitAll();
 				show_menu = 0;
 				quit = 1;
@@ -1843,6 +1864,7 @@ void Menu_loop(void) {
 				}
 			} break;
 			case ITEM_QUIT:
+				Menu_holdScreenForQuit();
 				// before Netplay_quitAll so the netplay guard inside can skip
 				// the autosave while a session is live
 				Menu_autosaveQuit();
@@ -1983,7 +2005,10 @@ void Menu_loop(void) {
 	}
 	PAD_reset();
 
-	GFX_clearAll();
+	// quitting with the menu held on screen (Menu_holdScreenForQuit): clearing
+	// would flip it once more without its dimmed game behind
+	if (!(quit && exists(HELD_FRAME_PATH)))
+		GFX_clearAll();
 
 	int count = 0;
 	char** overlayList = config.frontend.options[FE_OPT_OVERLAY].values;

@@ -175,6 +175,8 @@ static void updateLinkCpuBoost(void) {
 	LOG_info("GBALink: link cable %s, CPU %s\n", want ? "busy" : "quiet", want ? "Performance" : "back to setting");
 }
 
+#define RESUME_PREVIEW_FRAMES 30 // frames the resume screenshot stays the clear image
+
 int main(int argc, char* argv[]) {
 	if (argc >= 4 && argc <= 5 && !strcmp(argv[1], "--dump-options"))
 		return OptsDump_run(argv[2], argv[3], argc == 5 ? argv[4] : NULL);
@@ -189,6 +191,7 @@ int main(int argc, char* argv[]) {
 
 	PWR_setCPUSpeed(CPU_SPEED_PERFORMANCE); // start up in performance mode, faster init
 	PWR_pinToCores(CPU_CORE_PERFORMANCE);	// thread affinity
+	Audio_startWarmup();					// the codec's setup overlaps video and core loading
 
 	char core_path[MAX_PATH];
 	char rom_path[MAX_PATH];
@@ -197,9 +200,16 @@ int main(int argc, char* argv[]) {
 	if (argc < 3)
 		return EXIT_FAILURE;
 
+	unlink(HELD_FRAME_PATH); // a marker left by a quit nextui never picked up
 	snprintf(core_path, sizeof(core_path), "%s", argv[1]);
 	snprintf(rom_path, sizeof(rom_path), "%s", argv[2]);
 	getEmuName(rom_path, tag_name);
+
+	// resuming: the startup flips show the state's screenshot, not black
+	SDL_Surface* resume_preview = State_loadResumePreview(rom_path, tag_name);
+	PLAT_setClearImage(resume_preview);
+	if (resume_preview)
+		Video_skipFadeIn(); // the game goes on from the frame already on screen
 
 	screen = GFX_init(MODE_MENU);
 
@@ -260,8 +270,10 @@ int main(int argc, char* argv[]) {
 
 	// Mute audio during startup to avoid pops (InitSettings would be logical, but too late)
 	SND_overrideMute(1);
+	Audio_joinWarmup();
 	SND_init(core.sample_rate, core.fps);
-	InitSettings(); // after we initialize audio
+	Audio_endWarmup(); // SDL's device holds the dmix open now
+	InitSettings();	   // after we initialize audio
 	AudioMgr_init();
 	AudioMgr_setCallback(Audio_onSinkChanged);
 	Menu_init();
@@ -306,8 +318,11 @@ int main(int argc, char* argv[]) {
 	GFX_clear(screen);
 
 	// need to draw real black background first otherwise u get weird pixels sometimes
-
+	// (the resume screenshot instead, until the core's first frame replaces it)
+	PLAT_drawClearImage(screen);
 	GFX_flip(screen);
+	GFX_clear(screen);
+	PLAT_holdFrames(resume_preview && State_isResumePending()); // see the main loop
 
 	Special_init(); // after config
 
@@ -378,6 +393,19 @@ int main(int argc, char* argv[]) {
 			run_frame();
 		}
 		Input_runDeferredShortcut(); // save/load/reset shortcuts: never from inside core.run()
+		if (resume_preview) {
+			// a state the core takes late (mupen64plus-next): its boot frames stay
+			// behind the screenshot. Then it stays the clear image a little longer,
+			// for a core whose frame size settles on a later frame (flycast)
+			static int preview_frames = 0;
+			int pending = State_isResumePending();
+			PLAT_holdFrames(pending);
+			if (!pending && ++preview_frames >= RESUME_PREVIEW_FRAMES) {
+				PLAT_setClearImage(NULL);
+				SDL_FreeSurface(resume_preview);
+				resume_preview = NULL;
+			}
+		}
 		Core_applyPendingAV();
 		if (Netplay_isActive()) {
 			Netplay_postFrame();
@@ -484,7 +512,10 @@ int main(int argc, char* argv[]) {
 		CoreNetplay_byeSend(CORE_NETPLAY_BYE_PORT);
 	if (CoreNetplay_hasEnded())
 		Menu_notice("Netplay ended", "The other player left or the connection was lost.", 3000);
-	SDL_Surface* converted = Menu_captureScreenSurface(screen->format->format);
+	// a held frame (MENU+SELECT, Quit from the menu): no fade, the frame stays up
+	// until nextui starts on the same picture (HELD_FRAME_PATH)
+	int hold_frame = exists(HELD_FRAME_PATH);
+	SDL_Surface* converted = hold_frame ? NULL : Menu_captureScreenSurface(screen->format->format);
 	if (converted) {
 		GFX_animateSurfaceOpacity(converted, 0, 0, converted->w, converted->h, 255, 0, CFG_getMenuTransitions() ? 200 : 20, 1);
 		SDL_FreeSurface(converted);
@@ -521,7 +552,15 @@ finish:
 	// Reenable as soon as we have a more recent SDL available, if ever.
 	//SND_quit();
 	PAD_quit();
-	GFX_quit();
+	if (hold_frame) {
+		// the frame stays up for nextui: tearing the GL window down blanks
+		// the screen (Brick), so the process exit frees it; DRM (tg5050) blanks it
+		// once released, so a child holds it until nextui's first frame
+		PLAT_holdDisplayOnExit();
+	} else {
+		PLAT_keepScreenOnQuit(); // the fade-out already ended on black
+		GFX_quit();
+	}
 	Menu_waitScreenshotSave();
 	// Last: QuitSettings() munmaps the libmsettings shared memory. It used to run
 	// right after Notification_quit(), while the VIB_thread (stopped only by

@@ -587,6 +587,7 @@ void VIB_setStrength(int strength);
 int VIB_getStrength(void);
 int VIB_scaleStrength(int strength);
 void VIB_singlePulse(int strength, int duration_ms);
+void VIB_startPulse(int strength, int duration_ms);
 void VIB_triplePulse(int strength, int duration_ms, int gap_ms);
 void VIB_previewStrength(void); // feedback pulse for the "Vibration strength" setting
 
@@ -712,6 +713,11 @@ SDL_Surface* PLAT_initVideo(void);
 void PLAT_quitVideo(void);
 void PLAT_clearVideo(SDL_Surface* screen);
 void PLAT_clearAll(void);
+void PLAT_setClearImage(SDL_Surface* image); // NULL: back to black
+bool PLAT_holdDisplayOnExit(void);			 // DRM: a child keeps this frame up after exit (see generic_video.c)
+void PLAT_keepScreenOnQuit(void);			 // GFX_quit leaves the last frame up instead of clearing to black
+void PLAT_drawClearImage(SDL_Surface* screen);
+void PLAT_holdFrames(bool hold); // PLAT_GL_Swap presents nothing while set
 void PLAT_setVsync(int vsync);
 SDL_Surface* PLAT_resizeVideo(int w, int h, int pitch);
 void PLAT_setSharpness(int sharpness);
@@ -897,6 +903,11 @@ void PLAT_pinThreadsByCommToCoreSet(const char* comm_prefix, int set); // thread
 // call PWR_pinHelperThread() when they start. No-op in every other app.
 void PWR_setHelperThreadCoreSet(int set_or_minus1);
 void PWR_pinHelperThread(void);
+// Background work that is not part of a frame (RetroAchievements requests and
+// the curl they run, badge downloads): moves the calling thread, and anything
+// it spawns, to the slow core set, off the core the emulator is pinned to.
+// No-op where there is one cluster.
+void PWR_pinBackgroundThread(void);
 void PLAT_setRumble(int strength);
 void PLAT_captureRecStop(void);
 void PLAT_pokeCapture(void); // republish a frame for the OSD capture daemons when the app is idle

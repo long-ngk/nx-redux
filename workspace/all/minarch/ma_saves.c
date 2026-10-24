@@ -6,6 +6,7 @@
 #include "ma_state_read.h"
 #include "notification.h"
 #include "ra_integration.h"
+#include <SDL2/SDL_image.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <string.h>
@@ -176,6 +177,13 @@ static bool State_unserialize(void* state, size_t data_size, size_t state_size) 
 	return data_size > state_size && core.unserialize(state, state_size);
 }
 
+// A resume the core refuses at load keeps its decompressed state here, so the
+// retries from run_frame are only the core call (see State_resumePending)
+static int keep_refused_state = 0;
+static void* refused_state = NULL;
+static size_t refused_data_size = 0;
+static size_t refused_state_size = 0;
+
 int State_read(void) { // from picoarch
 	// Block load states in RetroAchievements hardcore mode
 	if (RA_isHardcoreModeActive()) {
@@ -232,6 +240,13 @@ int State_read(void) { // from picoarch
 
 	if (!State_unserialize(state, data_size, state_size)) {
 		LOG_error("Error restoring save state: %s\n", filename);
+		if (keep_refused_state) {
+			free(refused_state);
+			refused_state = state;
+			refused_data_size = data_size;
+			refused_state_size = state_size;
+			state = NULL;
+		}
 		goto error;
 	}
 	success = 1;
@@ -408,9 +423,12 @@ void State_autosave(void) {
 	state_slot = last_state_slot;
 }
 // A resume the core refused before its first frame (mupen64plus-next only
-// accepts states once its emulation thread runs): retried from run_frame.
-#define RESUME_RETRY_EVERY 10 // frames between attempts
+// accepts states once its emulation thread runs): retried from run_frame,
+// every frame with the state kept in memory, else every RESUME_RETRY_EVERY
+// frames from the file
+#define RESUME_RETRY_EVERY 10 // frames between attempts that read the file
 #define RESUME_RETRY_MAX 30	  // ~5 s at 60 fps, then the game just starts fresh
+#define RESUME_RETRY_MAX_FRAMES (RESUME_RETRY_EVERY * RESUME_RETRY_MAX)
 static int pending_resume_slot = -1;
 static int pending_resume_wait = 0;
 static int pending_resume_tries = 0;
@@ -425,6 +443,38 @@ static int State_readSlot(int slot) {
 	return ok;
 }
 
+SDL_Surface* State_loadResumePreview(const char* rom_path, const char* tag_name) {
+	// netplay starts from a clean boot (see main), and a client's slot
+	// markers live in its isolated dir
+	if (getenv("NETPLAY_ROLE") || getenv("NX_CORE_NETPLAY") || getenv("NETPLAY_SAVES_DIR"))
+		return NULL;
+	if (!exists(RESUME_SLOT_PATH))
+		return NULL;
+	int slot = getInt(RESUME_SLOT_PATH);
+	if (slot < 0 || slot > AUTO_RESUME_SLOT)
+		return NULL;
+	// named like Menu_init's slot files: the m3u's name for a multi-disc game
+	char m3u_path[MAX_PATH];
+	const char* name = M3U_findForRom(rom_path, m3u_path, sizeof(m3u_path)) ? baseName(m3u_path) : baseName(rom_path);
+	char path[MAX_PATH];
+	snprintf(path, sizeof(path), "%s/.minui/%s/%s.%d.bmp", SHARED_USERDATA_PATH, tag_name, name, slot);
+	if (!exists(path))
+		return NULL;
+	SDL_Surface* image = IMG_Load(path); // a PNG despite the name
+	if (!image)
+		return NULL;
+	SDL_Surface* converted = SDL_ConvertSurfaceFormat(image, SDL_PIXELFORMAT_ARGB8888, 0);
+	SDL_FreeSurface(image);
+	if (converted)
+		SDL_SetSurfaceBlendMode(converted, SDL_BLENDMODE_NONE);
+	return converted;
+}
+
+static void State_dropRefused(void) {
+	free(refused_state);
+	refused_state = NULL;
+}
+
 void State_resume(void) {
 	if (!exists(RESUME_SLOT_PATH))
 		return;
@@ -434,23 +484,48 @@ void State_resume(void) {
 	if (slot < 0 || slot > AUTO_RESUME_SLOT)
 		return; // corrupt slot file
 
-	if (State_readSlot(slot) || RA_isHardcoreModeActive())
+	keep_refused_state = 1;
+	int resumed = State_readSlot(slot);
+	keep_refused_state = 0;
+	if (resumed || RA_isHardcoreModeActive()) {
+		State_dropRefused();
 		return;
+	}
 	char filename[MAX_PATH];
 	int last_state_slot = state_slot;
 	state_slot = slot;
 	State_getPath(filename);
 	state_slot = last_state_slot;
-	if (!exists(filename))
+	if (!exists(filename)) {
+		State_dropRefused();
 		return;
+	}
 	pending_resume_slot = slot;
 	pending_resume_wait = RESUME_RETRY_EVERY;
 	pending_resume_tries = 0;
 	LOG_info("Resume state not accepted yet, retrying once the core runs\n");
 }
 
+int State_isResumePending(void) {
+	return pending_resume_slot >= 0;
+}
+
 void State_resumePending(void) {
-	if (pending_resume_slot < 0 || --pending_resume_wait > 0)
+	if (pending_resume_slot < 0)
+		return;
+	if (refused_state) {
+		if (State_unserialize(refused_state, refused_data_size, refused_state_size)) {
+			EmuTime_reset(); // the loaded state starts a new emulated timeline
+			Rewind_on_state_change();
+			State_dropRefused();
+			pending_resume_slot = -1;
+		} else if (++pending_resume_tries >= RESUME_RETRY_MAX_FRAMES) {
+			State_dropRefused();
+			pending_resume_slot = -1;
+		}
+		return;
+	}
+	if (--pending_resume_wait > 0)
 		return;
 	pending_resume_wait = RESUME_RETRY_EVERY;
 	if (State_readSlot(pending_resume_slot) || ++pending_resume_tries >= RESUME_RETRY_MAX)
