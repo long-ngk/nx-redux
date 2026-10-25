@@ -1,0 +1,108 @@
+HUONG DAN CHAY JM.pak TREN MAY THAT (Trimui Brick Pro / tg5040)
+================================================================
+
+Muc tieu: dua apps/JM.pak len may, mo Tools > JM, chay thu game J2ME.
+Chua co ai test tren may that, nen neu loi thi ghi vao DEBUG.txt (xem muc 6).
+
+
+1. CHUAN BI TREN MAY TINH (WSL Debian)
+--------------------------------------
+  sudo apt install -y unzip binutils adb openssh-client tar
+  git pull origin feat/migrate-java-app
+  # kiem tra file nang da keo ve du:
+  ls -l apps/JM.pak/zulu/lib/server/libjvm.so apps/JM.pak/launcher/libs/libs.aarch64/liblove-11.5.so
+
+
+2. CHON CACH KET NOI (adb HOAC ssh)
+-----------------------------------
+A) SSH qua WiFi (de nhat tren WSL)
+   - Tren may: Settings > Developer > Enable SSH. Noi WiFi cung mang voi may tinh.
+   - Menu se hien "root@<IP>" va mat khau (thuong la "tina", hoac "No password").
+   - Tren may tinh:
+       export JM_SSH=root@<IP>
+       ssh $JM_SSH echo ok          # thu ket noi, nhap mat khau 1 lan
+
+B) adb qua USB
+   WSL2 khong thay USB cua Windows. Chon 1 trong 2:
+   - usbipd-win (PowerShell Administrator tren Windows):
+       winget install usbipd
+       usbipd list
+       usbipd bind --busid <BUSID>
+       usbipd attach --wsl --busid <BUSID>
+     Trong WSL:  adb kill-server && adb devices
+   - adb server chay tren Windows (cung phien ban adb voi WSL):
+       Windows:  adb kill-server ; adb -a nodaemon server start
+       WSL:      export ADB_SERVER_SOCKET=tcp:$(ip route show default | awk '{print $3}'):5037
+                 adb devices
+   Trang thai phai la "device". "unauthorized" -> bam cho phep tren may.
+   Neu adb khong thay may thi dung SSH (cach A).
+
+
+3. DAY APP LEN MAY
+------------------
+Lenh chay tu thu muc goc cua repo. Khong dat JM_SSH = dung adb.
+
+  ./scripts/jm/deploy.sh            # lan dau: day tat ca (~100 MB, vai phut)
+  ./scripts/jm/deploy.sh --fast     # sau do: chi script va Lua
+  ./scripts/jm/device-check.sh      # liet ke thu vien he thong con thieu
+
+App duoc cai vao /mnt/SDCARD/Tools/JM.pak (doi bang JM_DEST=...).
+Hay THOAT app JM tren may truoc khi day lai.
+
+
+4. CHEP GAME VA CHAY
+--------------------
+Chep file .jar vao thu muc theo do phan giai (tren the SD cua may):
+  /mnt/SDCARD/Tools/JM.pak/Jars/240x320/
+  /mnt/SDCARD/Tools/JM.pak/Jars/320x240/
+  /mnt/SDCARD/Tools/JM.pak/Jars/384x288/
+  /mnt/SDCARD/Tools/JM.pak/Jars/128x128/
+Vi du qua ssh:
+  scp -O "Game.jar" $JM_SSH:/mnt/SDCARD/Tools/JM.pak/Jars/320x240/
+
+Tren may: Tools > JM. Lan dau mo se quet jar va tao anh bia (.png) + .info,
+co the mat vai giay.
+
+Phim trong launcher (can xac nhan tren may that):
+  D-pad: chon game      L1/R1: doi tab      A: choi 30 FPS
+  X: choi 60 FPS        B: thoat            Y: giao dien
+  Select: doi che do scale   Start: xoa key mapping
+
+
+5. CHECKLIST TEST (danh dau vao DEBUG.txt)
+------------------------------------------
+  [ ] deploy.sh chay xong khong loi
+  [ ] device-check.sh khong co dong "not found" / "MISSING"
+  [ ] Tools > JM mo duoc, thay launcher (khong bi treo man hinh den)
+  [ ] Phim A/B/X/Y dung nhu mo ta o muc 4
+  [ ] Chon game, bam A: game J2ME hien hinh
+  [ ] Co tieng
+  [ ] Phim dieu khien trong game dung
+  [ ] Thoat game: quay lai launcher, con nho game vua chon
+  [ ] B thoat launcher: ve menu chinh nx-redux binh thuong
+
+
+6. NEU CO LOI
+-------------
+Tren may tinh ben may that, o thu muc goc repo:
+
+  # (tuy chon, de log luu lai sau khi tat may)
+  # tren may: Settings > Developer > Debug logging = On, roi mo lai JM
+
+  {
+    echo "### device-check"
+    ./scripts/jm/device-check.sh 2>&1
+    echo
+    echo "### log"
+    ./scripts/jm/deploy.sh --logs-only 2>&1
+  } >> scripts/jm/DEBUG.txt
+
+Roi mo scripts/jm/DEBUG.txt, dien cac muc "MO TA" (buoc lam, thay gi tren man hinh,
+mong doi gi), sau do:
+
+  git add scripts/jm/DEBUG.txt
+  git commit -m "debug(jm): bao loi tu may that"
+  git push origin feat/migrate-java-app
+
+Ben may kia: git pull origin feat/migrate-java-app, doc scripts/jm/DEBUG.txt.
+Chi dan mat khau, IP noi bo hoac thong tin ca nhan thi xoa truoc khi commit.

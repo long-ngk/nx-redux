@@ -1,0 +1,30 @@
+DEBUG JM.pak - dan loi tu may that vao day roi commit
+=======================================================
+(Xem cach lay log o muc 6 cua HUONG_DAN.txt. Co the them nhieu lan loi, moi lan 1 khoi.)
+
+----- LAN 1 -----
+Ngay gio:
+Thiet bi / firmware (cat /etc/version):
+Cach ket noi (adb / ssh):
+Lenh da chay:
+
+MO TA
+- Buoc da lam:
+- Thay gi tren man hinh:
+- Mong doi:
+
+KET QUA CHECKLIST (ghi OK / LOI / chua thu)
+- deploy.sh:
+- device-check.sh:
+- mo Tools > JM:
+- phim A/B/X/Y:
+- vao game:
+- tieng:
+- phim trong game:
+- thoat ve launcher:
+
+LOI / LOG (dan nguyen van ben duoi)
+-------------------------------------------------------
+
+
+-------------------------------------------------------
