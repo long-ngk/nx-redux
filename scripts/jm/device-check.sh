@@ -1,12 +1,14 @@
 #!/bin/sh
 # Report missing shared libraries for every native binary in the JM pak, as seen on the device.
-# Run from a machine with adb after deploy.sh.
+# Transport: adb by default; JM_SSH=root@<device-ip> uses SSH.
 set -eu
 
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 DEST="${JM_DEST:-/mnt/SDCARD/Tools/JM.pak}"
-command -v adb >/dev/null || { echo "need adb"; exit 1; }
 
-adb shell "
+. "$ROOT/scripts/jm/transport.sh"
+
+remote "
 cd '$DEST' || exit 1
 echo \"fw: \$(cat /etc/version 2>/dev/null)\"
 echo \"model: \${TRIMUI_MODEL:-unknown}\"
