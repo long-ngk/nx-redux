@@ -1,0 +1,30 @@
+$ ./scripts/jm/device-check.sh
+fw: 1.1.1
+model: unknown
+have  /usr/trimui/lib/libSDL2-2.0.so.0
+have  /usr/lib/libSDL2_ttf-2.0.so.0
+have  /usr/lib/libcurl.so.4
+have  /usr/trimui/lib/libmpg123.so.0
+MISSING /usr/lib/libGLESv1_CM.so
+MISSING /usr/trimui/lib/libGLESv1_CM.so
+== ./launcher/libs/love
+   all resolved
+== ./freej2me/sdl_interface
+   all resolved
+== ./zulu/bin/java
+   all resolved
+== ./zulu/lib/libawt.so
+Segmentation fault
+   all resolved
+== ./zulu/lib/liblwjgl_opengles.so
+Segmentation fault
+   all resolved
+== ./zulu/lib/libm3g.so
+Segmentation fault
+   all resolved
+== ./zulu/lib/libSDL2_mixer-2.0.so.0
+Segmentation fault
+   all resolved
+== ./launcher/libs/libs.aarch64/liblove-11.5.so
+Segmentation fault
+   all resolved
