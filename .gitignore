@@ -5,6 +5,7 @@
 !workspace/all/musicplayer/include/fdk_aac/lib/*.so*
 !skeleton/BASE/Emus/**/*.so
 !skeleton/SYSTEM/shared/lib/*.so
+!apps/JM.pak/**/*.so
 *.elf
 *.dtb
 *.zip
@@ -77,3 +78,5 @@ workspace/all/scraper/ss_credentials.h
 # third-party prebuilts built from pinned source (workspace/all/prebuilts/*.sh)
 workspace/all/prebuilts/work
 workspace/all/prebuilts/output
+
+stockos-apps/
