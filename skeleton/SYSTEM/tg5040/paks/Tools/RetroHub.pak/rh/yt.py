@@ -4,9 +4,11 @@
 import html
 import json
 import os
+import random
 import re
 import ssl
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -86,6 +88,10 @@ def parse_age_hours(text: str) -> float:
     elif "năm" in s or "year" in s:
         return val * 24.0 * 365.0
     return 999999.0
+
+
+# Saved feeds older than this are refetched; the stale copy is only an offline fallback.
+FEED_TTL_SEC = 3600
 
 
 def get_effective_query(query: str) -> str:
@@ -447,7 +453,7 @@ def fetch_more_youtube(query: str, cont_token: str = None) -> tuple:
     return more_videos, next_token
 
 
-def search_youtube(query: str, limit: int = 24) -> list:
+def search_youtube(query: str, limit: int = 24, save: bool = True) -> list:
     """Search videos on YouTube by keyword, preserving natural YouTube ranking without sorting.
 
     Returns a list of dicts:
@@ -492,20 +498,70 @@ def search_youtube(query: str, limit: int = 24) -> list:
             print(f"[rh.yt] Continuation fetch error: {e}")
 
     final_results = results[:limit]
-    if final_results:
+    if final_results and save:
         save_feed_cache(clean_query, final_results)
     return final_results
 
 
-def get_trending(limit: int = 24) -> list:
+# Anonymous browse(FEwhat_to_watch) returns an empty page, so Home is built from random searches.
+HOME_FEED_KEY = "__home__"
+HOME_TTL_SEC = 600
+HOME_TOPICS = ["Nhạc Trẻ Hay Nhất", "Hài Hước", "Game Retro", "Hoạt Hình", "Review Phim",
+               "Nấu Ăn", "Du Lịch", "Công Nghệ", "Thể Thao", "Nhạc Lofi", "Tin Tức", "Khoa Học",
+               "Nhạc Remix", "Phim Hài", "Động Vật", "Âm Nhạc Acoustic"]
+
+
+def get_home_feed(limit: int = 24, force: bool = False) -> list:
+    """Random mix of videos from a few topics (your search tabs plus built-in ones)."""
+    cached, ts = load_feed_cache(HOME_FEED_KEY)
+    if not force and cached and (time.time() - ts) < HOME_TTL_SEC:
+        return cached
+
+    pool = [q for q in load_search_history() if q] + HOME_TOPICS
+    random.shuffle(pool)
+    picks = []
+    for q in pool:
+        if q.lower() not in [p.lower() for p in picks]:
+            picks.append(q)
+        if len(picks) == 4:
+            break
+
+    batches = []
+
+    def work(q):
+        batch = search_youtube(q, limit=16, save=False)
+        if batch:
+            random.shuffle(batch)
+            batches.append(batch[:8])
+
+    threads = [threading.Thread(target=work, args=(q,), daemon=True) for q in picks]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(12)
+
+    merged, seen = [], set()
+    for batch in list(batches):
+        for v in batch:
+            if v["id"] not in seen:
+                seen.add(v["id"])
+                merged.append(v)
+    random.shuffle(merged)
+    items = merged[:limit]
+    if items:
+        save_feed_cache(HOME_FEED_KEY, items)
+    return items or cached
+
+
+def get_trending(limit: int = 24, force: bool = False) -> list:
     """Fetch YouTube Trending / Music videos."""
     cached, ts = load_feed_cache("Music")
-    if cached and (time.time() - ts) < 3600:
+    if not force and cached and (time.time() - ts) < FEED_TTL_SEC:
         return cached
     items = search_youtube("Nhạc Trẻ Trending Việt Nam", limit=limit)
     if items:
         save_feed_cache("Music", items)
-    return items
+    return items or cached
 
 
 def _deep_find_bounded(node, key, max_nodes: int = 20000):

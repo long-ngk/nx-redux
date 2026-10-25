@@ -11,6 +11,9 @@ from ..yt_player import play_video
 from .base import BaseScreen
 
 
+HOME_TAB = "Trang chủ"
+
+
 class YoutubeScreen(BaseScreen):
     """YouTube 3x2 Grid Browser with background thumbnail caching and stream player handoff."""
 
@@ -35,12 +38,12 @@ class YoutubeScreen(BaseScreen):
         tabs = []
         if favs:
             tabs.append("★ Yêu thích")
-        tabs.append("Trending")
+        tabs.append(HOME_TAB)
         if playback.load_watched():
             tabs.append("Lịch sử")
         history = yt.load_search_history() or ["Nhạc Trẻ Remix", "Game Retro", "Hoạt Hình"]
         for q in history:
-            if q not in ("Trending", "★ Yêu thích", "Yêu thích", "Lịch sử") and q not in tabs:
+            if q not in ("Trending", HOME_TAB, "★ Yêu thích", "Yêu thích", "Lịch sử") and q not in tabs:
                 tabs.append(q)
         self.recent_queries = tabs
 
@@ -67,7 +70,7 @@ class YoutubeScreen(BaseScreen):
         except Exception:
             pass
 
-    def load_current_tab(self):
+    def load_current_tab(self, force=False):
         if not self.recent_queries or self.active_query_idx >= len(self.recent_queries):
             self.active_query_idx = 0
         cur_q = self.recent_queries[self.active_query_idx]
@@ -82,20 +85,20 @@ class YoutubeScreen(BaseScreen):
             try:
                 if cur_q in ("★ Yêu thích", "Yêu thích"):
                     self.videos = yt.load_favorites() or []
-                elif cur_q == "Trending":
-                    self.videos = yt.get_trending() or []
+                elif cur_q == HOME_TAB:
+                    self.videos = yt.get_home_feed(force=force) or []
                 elif cur_q == "Lịch sử":
                     self.videos = playback.load_watched() or []
                 else:
-                    cached, _ = yt.load_feed_cache(cur_q)
-                    if cached:
+                    cached, ts = yt.load_feed_cache(cur_q)
+                    if not force and cached and (time.time() - ts) < yt.FEED_TTL_SEC:
                         self.videos = cached
                     else:
-                        self.videos = yt.search_youtube(cur_q) or []
+                        self.videos = yt.search_youtube(cur_q) or cached
             except Exception as e:
                 self.engine.toast(f"Lỗi tải YouTube: {e}")
             self.loading = False
-            if cur_q not in ("★ Yêu thích", "Yêu thích", "Trending", "Lịch sử"):
+            if cur_q not in ("★ Yêu thích", "Yêu thích", HOME_TAB, "Lịch sử"):
                 self.has_more = bool(yt.get_continuation_token(cur_q))
 
             # Background download thumbnails
@@ -113,7 +116,7 @@ class YoutubeScreen(BaseScreen):
         if self.loading_more or not self.has_more:
             return
         cur_q = self.recent_queries[self.active_query_idx] if self.active_query_idx < len(self.recent_queries) else ""
-        if cur_q in ("★ Yêu thích", "Yêu thích", "Trending", "Lịch sử"):
+        if cur_q in ("★ Yêu thích", "Yêu thích", HOME_TAB, "Lịch sử"):
             return
         self.loading_more = True
 
@@ -141,6 +144,7 @@ class YoutubeScreen(BaseScreen):
             ("A", "Xem video", (0, 230, 150), (220, 225, 235), True),
             ("X", "Tìm kiếm", (0, 210, 255), (220, 225, 235), True),
             ("Y", "Yêu thích", (255, 200, 0), (220, 225, 235), True),
+            ("START", "Làm mới" if state.current_lang == "VI" else "Refresh", (0, 246, 246), (220, 225, 235), True),
             ("B", tr("footer_back"), (255, 75, 75), (220, 225, 235), False),
         ]
 
@@ -155,9 +159,16 @@ class YoutubeScreen(BaseScreen):
         btn_b = inputs.get("btn_b")
         btn_x = inputs.get("btn_x")
         btn_y = inputs.get("btn_y")
+        btn_start = inputs.get("btn_start")
 
         if btn_b:
             self.engine.pop_screen()
+            return True
+
+        if btn_start:
+            if not self.loading:
+                self.engine.toast("Đang làm mới..." if state.current_lang == "VI" else "Refreshing...")
+                self.load_current_tab(force=True)
             return True
 
         if btn_l1:
@@ -207,7 +218,7 @@ class YoutubeScreen(BaseScreen):
                 clean_t = yt.clean_yt_text(v.get("title", "Video"))
                 self.engine.toast(f"{action_str}: {clean_t[:24]}")
 
-                cur_tab = self.recent_queries[self.active_query_idx] if self.active_query_idx < len(self.recent_queries) else "Trending"
+                cur_tab = self.recent_queries[self.active_query_idx] if self.active_query_idx < len(self.recent_queries) else HOME_TAB
                 if cur_tab in ("★ Yêu thích", "Yêu thích"):
                     self.videos = new_favs
                     if not new_favs:
