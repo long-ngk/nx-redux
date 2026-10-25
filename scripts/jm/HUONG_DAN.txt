@@ -60,6 +60,27 @@ Chep file .jar vao thu muc theo do phan giai (tren the SD cua may):
 Vi du qua ssh:
   scp -O "Game.jar" $JM_SSH:/mnt/SDCARD/Tools/JM.pak/Jars/320x240/
 
+COPY CA THU MUC games/ CUA REPO (cau truc giong Jars/: games/320x240/*.jar ...)
+  Chay o thu muc goc repo. Dau "/." cuoi "games/." = copy NOI DUNG, khong tao them
+  thu muc games/ ben trong Jars/. Ten file co dau cach van chay duoc.
+
+  Qua SSH (da dat JM_SSH, xem muc 2A):
+    tar -C games -cf - . | ssh $JM_SSH "tar -C /mnt/SDCARD/Tools/JM.pak/Jars -xf -"
+  Neu tar -C bao loi tren may:
+    scp -O -r games/. $JM_SSH:/mnt/SDCARD/Tools/JM.pak/Jars/
+
+  Qua adb:
+    adb push games/. /mnt/SDCARD/Tools/JM.pak/Jars/
+
+  Kiem tra da len may:
+    ssh $JM_SSH "ls -l /mnt/SDCARD/Tools/JM.pak/Jars/*"      # SSH
+    adb shell "ls -l /mnt/SDCARD/Tools/JM.pak/Jars/*"        # adb
+
+Sau khi copy: thoat JM roi mo lai (Tools > JM) de quet lai. Lan dau se tao
+anh bia (.png) va .info canh file .jar, co the mat vai giay.
+Thu muc con phai dung do phan giai cua game: 128x128, 240x320, 320x240, 384x288.
+Luu y: games/ chua duoc .gitignore; dung "git add ." neu khong muon day file .jar len git.
+
 Tren may: Tools > JM. Lan dau mo se quet jar va tao anh bia (.png) + .info,
 co the mat vai giay.
 
