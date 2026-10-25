@@ -31,6 +31,7 @@ class SettingsScreen(BaseScreen):
             {"id": "lang_toggle", "title": tr("set_lang_title"), "label": lang_lbl},
             {"id": "view_mode_toggle", "title": tr("set_view_title"), "label": v_mode_lbl},
             {"id": "wifi_awake", "title": tr("set_wifi_awake"), "type": "toggle", "state": state.wifi_awake},
+            {"id": "yt_quality", "title": tr("set_yt_quality"), "label": f"{state.yt_quality}p"},
             {"id": "auto_update", "title": tr("set_auto_upd"), "type": "toggle", "state": state.auto_update},
             {"id": "check_update", "title": tr("set_check_upd"), "label": f"v{APP_VERSION}"},
             {"id": "logging", "title": tr("set_logging"), "type": "toggle", "state": state.enable_logging},
@@ -103,6 +104,10 @@ class SettingsScreen(BaseScreen):
             elif it_id == "wifi_awake":
                 msg = toggle_wifi_awake()
                 self.engine.toast(msg)
+                self.refresh_items()
+            elif it_id == "yt_quality":
+                state.yt_quality = {360: 480, 480: 720}.get(state.yt_quality, 360)
+                state.save_settings()
                 self.refresh_items()
             elif it_id == "auto_update":
                 state.auto_update = not state.auto_update

@@ -273,6 +273,142 @@ def resolve_retroarch_and_ffmpeg():
     return ra_bin, ra_dir, ffmpeg_core
 
 
+def resolve_ffplay():
+    """ffplay bundled with NX Redux (same binary its Media Player uses)."""
+    shared = os.environ.get("SHARED_SYSTEM_PATH") or os.path.join(SDCARD_PATH, ".system", "shared")
+    for c in (os.path.join(shared, "bin", "ffplay"), "/usr/bin/ffplay"):
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def load_quality() -> int:
+    import json
+    try:
+        with open(os.path.join(APP_DIR, "settings.json"), "r", encoding="utf-8") as f:
+            q = int(json.load(f).get("yt_quality", 360))
+    except Exception:
+        return 360
+    return q if q in (360, 480, 720) else 360
+
+
+def _ffplay_cmd(ffplay_bin, title, src, audio_only=False):
+    cmd = [ffplay_bin, "-fs", "-autoexit", "-loglevel", "error", "-sn",
+           "-framedrop", "-fast", "-skip_loop_filter", "all", "-skip_idct", "noref"]
+    # A pipe has no HTTP layer to take it; ffplay aborts on the unused option but still exits 0.
+    # The default 5 MB probe never completes on a live remux, so ffplay sits at 0:00 forever.
+    if src == "pipe:0":
+        cmd += ["-probesize", "200000", "-analyzeduration", "1000000"]
+    else:
+        cmd += ["-user_agent", "Mozilla/5.0"]
+    cmd += ["-window_title", title]
+    if audio_only:
+        cmd.append("-nodisp")
+    return cmd + ["-i", src]
+
+
+_MAX_FREQ = "/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq"
+
+
+def _read_max_freq():
+    try:
+        with open(_MAX_FREQ, "r") as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def _write_max_freq(khz):
+    try:
+        with open(_MAX_FREQ, "w") as f:
+            f.write(str(khz))
+    except OSError:
+        pass
+
+
+def extract_dash_streams(video_id: str, height: int):
+    """(video_url, audio_url, title) for H.264 up to `height` plus m4a audio, or None.
+
+    Only the tv_embedded client hands out these separate streams; the android
+    client used for 360p serves just the muxed format 18.
+    """
+    ensure_ytdlp_ready()
+    try:
+        import yt_dlp
+    except ImportError:
+        return None
+    opts = {
+        "format": f"bv[vcodec^=avc1][height<={height}]+ba[ext=m4a]",
+        "quiet": True, "no_warnings": True, "noplaylist": True, "no_color": True,
+        "nocheckcertificate": True, "skip_download": True,
+        "extractor_args": {"youtube": {"player_client": ["tv_embedded"]}},
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+    except Exception as e:
+        log(f"Khong lay duoc luong {height}p: {e}")
+        return None
+    fmts = info.get("requested_formats") or []
+    if len(fmts) != 2 or not all(f.get("url") for f in fmts):
+        return None
+    v, a = fmts
+    log(f"Phan tich thanh cong: '{info.get('title')}', format: {v.get('format_id')}+{a.get('format_id')} - "
+        f"{v.get('width')}x{v.get('height')}")
+    return v["url"], a["url"], info.get("title", video_id)
+
+
+def play_dash(video_id: str, height: int, ffplay_bin: str, ffmpeg_bin: str):
+    """Remux separate video+audio through ffmpeg into ffplay. None means the streams were unavailable."""
+    got = extract_dash_streams(video_id, height)
+    if not got:
+        return None
+    v_url, a_url, title = got
+    servers, ff, prev_freq = [], None, None
+    try:
+        ports = []
+        for u in (v_url, a_url):
+            srv = ThreadedHTTPServer(("127.0.0.1", find_free_port()), make_proxy_class(u))
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            servers.append(srv)
+            ports.append(srv.server_address[1])
+        ff = subprocess.Popen(
+            [ffmpeg_bin, "-nostdin", "-hide_banner", "-loglevel", "error",
+             "-i", f"http://127.0.0.1:{ports[0]}/v.mp4", "-i", f"http://127.0.0.1:{ports[1]}/a.m4a",
+             "-map", "0:v:0", "-map", "1:a:0", "-c", "copy", "-flush_packets", "1", "-f", "matroska", "pipe:1"],
+            stdout=subprocess.PIPE)
+        env = os.environ.copy()
+        env["HOME"] = env.get("USERDATA_PATH") or env.get("HOME", "/root")
+        # Same range Media Player.pak asks for; the launcher's default cap is too low for 720p software decode.
+        prev_freq = _read_max_freq()
+        _write_max_freq(2000000)
+        subprocess.call("echo 1 > /tmp/stay_awake 2>/dev/null", shell=True)
+        cmd = _ffplay_cmd(ffplay_bin, title, "pipe:0")
+        log(f"Command: {' '.join(cmd)}")
+        started = time.time()
+        res = subprocess.run(cmd, stdin=ff.stdout, env=env)
+        log(f"ffplay exit code: {res.returncode}")
+        if time.time() - started < 3:
+            return None
+        return res.returncode == 0
+    except Exception as e:
+        record_error(f"Loi khi phat video {height}p: {e}")
+        return False
+    finally:
+        if ff:
+            ff.kill()
+            ff.wait()
+        for s in servers:
+            try:
+                s.shutdown()
+                s.server_close()
+            except Exception:
+                pass
+        if prev_freq:
+            _write_max_freq(prev_freq)
+        subprocess.call("rm -f /tmp/stay_awake 2>/dev/null", shell=True)
+
+
 def play_video(video_id: str, direct_stream_url: str = None, direct_title: str = None,
                audio_only: bool = False):
     # Reset error marker
@@ -284,6 +420,15 @@ def play_video(video_id: str, direct_stream_url: str = None, direct_title: str =
 
     log(f"==================================================")
     log(f"Bat dau phat YouTube video ID: {video_id}")
+
+    quality = load_quality()
+    if quality > 360 and not direct_stream_url and not audio_only and not resolve_retroarch_and_ffmpeg()[0]:
+        ffplay_bin, ffmpeg_bin = resolve_ffplay(), shutil.which("ffmpeg")
+        if ffplay_bin and ffmpeg_bin:
+            played = play_dash(video_id, quality, ffplay_bin, ffmpeg_bin)
+            if played is not None:
+                return played
+            log(f"Khong co luong {quality}p, quay lai 360p.")
 
     if direct_stream_url:
         stream_url = direct_stream_url
@@ -437,6 +582,18 @@ input_joypad_driver = "sdl2"
             log(f"RetroArch exit code: {res.returncode}")
             success = (res.returncode == 0)
 
+        elif resolve_ffplay():
+            ffplay_bin = resolve_ffplay()
+            log(f"Khong co RetroArch, dung ffplay: {ffplay_bin}")
+            env = os.environ.copy()
+            env["HOME"] = env.get("USERDATA_PATH") or env.get("HOME", "/root")
+            cmd = _ffplay_cmd(ffplay_bin, title or video_id, play_url, audio_only)
+            log(f"Command: {' '.join(cmd)}")
+            subprocess.call("echo 1 > /tmp/stay_awake 2>/dev/null", shell=True)
+            res = subprocess.run(cmd, env=env)
+            subprocess.call("rm -f /tmp/stay_awake 2>/dev/null", shell=True)
+            log(f"ffplay exit code: {res.returncode}")
+            success = (res.returncode == 0)
 
         else:
             msg = "Hệ thống chưa cài RetroArch hoặc core FFMPEG!"

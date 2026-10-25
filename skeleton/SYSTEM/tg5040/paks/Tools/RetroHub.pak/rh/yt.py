@@ -1155,9 +1155,10 @@ def build_play_command(video_id: str, info_file: str = "/tmp/yt_stream_info.json
     If info_file exists, passes pre-extracted stream URL to bypass yt-dlp extraction entirely.
     """
     info_arg = f'--info-file "{info_file}"' if info_file else ""
+    app_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     cmd = f"""#!/bin/sh
 SDCARD_PATH="${{SDCARD_PATH:-/mnt/SDCARD}}"
-APP_DIR="$SDCARD_PATH/Apps/RetroHub"
+APP_DIR="{app_dir}"
 LOG_FILE="$SDCARD_PATH/RetroHub-yt.log"
 
 echo "=== YouTube Streaming: {video_id} ($(date 2>/dev/null)) ===" > "$LOG_FILE"

@@ -80,7 +80,7 @@ def build_session_command(session_path=None) -> str:
     # NB: use .replace(), not str.format(), because the shell uses ${VAR}.
     return """#!/bin/sh
 SDCARD_PATH="${SDCARD_PATH:-/mnt/SDCARD}"
-APP_DIR="$SDCARD_PATH/Apps/RetroHub"
+APP_DIR="__APP_DIR__"
 LOG_FILE="$SDCARD_PATH/RetroHub-yt.log"
 
 echo "=== YouTube Session ($(date 2>/dev/null)) ===" >> "$LOG_FILE"
@@ -104,7 +104,7 @@ cd "$APP_DIR"
 EXIT_CODE=$?
 
 echo "Session Exit Code: $EXIT_CODE" >> "$LOG_FILE"
-""".replace("__SESSION__", session_path)
+""".replace("__SESSION__", session_path).replace("__APP_DIR__", APP_DIR)
 
 
 def launch_session(engine, session) -> bool:

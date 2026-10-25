@@ -18,6 +18,8 @@ downloaded_view_mode = "grid" # Default to Grid Mode
 # Keep the Wi-Fi radio awake between packets. Off saves battery but drops idle
 # SSH sessions and can interrupt a long download, so it is user-controlled.
 wifi_awake = False
+# Max YouTube resolution (360/480/720). 360 is the one muxed stream YouTube serves; above that needs separate video+audio.
+yt_quality = 360
 # Check GitHub for a newer build when the app starts.
 auto_update = True
 # Versions the user chose to skip, so the prompt does not come back for them.
@@ -56,6 +58,7 @@ if os.path.exists(SETTINGS_FILE):
             current_lang = cfg.get("language", "EN")
             downloaded_view_mode = cfg.get("view_mode", "grid")
             wifi_awake = cfg.get("wifi_awake", False)
+            yt_quality = cfg.get("yt_quality", 360) if cfg.get("yt_quality") in (360, 480, 720) else 360
             auto_update = cfg.get("auto_update", True)
             enable_logging = cfg.get("enable_logging", False)
             device_id = cfg.get("device_id", "")
@@ -93,6 +96,7 @@ def save_settings():
                     "language": current_lang,
                     "view_mode": downloaded_view_mode,
                     "wifi_awake": wifi_awake,
+                    "yt_quality": yt_quality,
                     "auto_update": auto_update,
                     "enable_logging": enable_logging,
                     "device_id": device_id,
