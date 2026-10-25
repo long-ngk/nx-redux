@@ -77,3 +77,7 @@ workspace/all/scraper/ss_credentials.h
 # third-party prebuilts built from pinned source (workspace/all/prebuilts/*.sh)
 workspace/all/prebuilts/work
 workspace/all/prebuilts/output
+
+stockos-apps/
+migration-apps
+trimui_sdcard
