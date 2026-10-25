@@ -84,7 +84,8 @@ ensure_gles_alias() {
     dest="$GAMEDIR/zulu/lib/libGLES_CM.so"
     [ -e "$dest" ] && return 0
     ls /usr/lib/libGLES_CM.so /usr/trimui/lib/libGLES_CM.so >/dev/null 2>&1 && return 0
-    for d in /usr/lib /usr/trimui/lib; do
+    # Firmware 1.1.1 has no GLES 1; PortMaster's bundle ships one.
+    for d in /usr/lib /usr/trimui/lib "${SDCARD_PATH:-/mnt/SDCARD}/Emus/shared/PortMaster/lib"; do
         for f in "$d"/libGLESv1_CM.so*; do
             [ -f "$f" ] && cp -f "$f" "$dest" && return 0
         done
