@@ -7,6 +7,7 @@ import shutil
 import socket
 import socketserver
 import ssl
+import struct
 import subprocess
 import sys
 import threading
@@ -295,11 +296,8 @@ def load_quality() -> int:
 def _ffplay_cmd(ffplay_bin, title, src, audio_only=False):
     cmd = [ffplay_bin, "-fs", "-autoexit", "-loglevel", "error", "-sn",
            "-framedrop", "-fast", "-skip_loop_filter", "all", "-skip_idct", "noref"]
-    # A pipe has no HTTP layer to take it; ffplay aborts on the unused option but still exits 0.
-    # The default 5 MB probe never completes on a live remux, so ffplay sits at 0:00 forever.
-    if src == "pipe:0":
-        cmd += ["-probesize", "200000", "-analyzeduration", "1000000"]
-    else:
+    # ffplay aborts on an option the input never consumes, yet still exits 0.
+    if src.startswith("http"):
         cmd += ["-user_agent", "Mozilla/5.0"]
     cmd += ["-window_title", title]
     if audio_only:
@@ -327,7 +325,7 @@ def _write_max_freq(khz):
 
 
 def extract_dash_streams(video_id: str, height: int):
-    """(video_url, audio_url, title) for H.264 up to `height` plus m4a audio, or None.
+    """{video, audio, title, duration} (yt-dlp format dicts) for H.264 up to `height` plus m4a audio, or None.
 
     Only the tv_embedded client hands out these separate streams; the android
     client used for 360p serves just the muxed format 18.
@@ -355,49 +353,131 @@ def extract_dash_streams(video_id: str, height: int):
     v, a = fmts
     log(f"Phan tich thanh cong: '{info.get('title')}', format: {v.get('format_id')}+{a.get('format_id')} - "
         f"{v.get('width')}x{v.get('height')}")
-    return v["url"], a["url"], info.get("title", video_id)
+    return {"video": v, "audio": a, "title": info.get("title", video_id), "duration": info.get("duration") or 0}
 
 
-def play_dash(video_id: str, height: int, ffplay_bin: str, ffmpeg_bin: str):
-    """Remux separate video+audio through ffmpeg into ffplay. None means the streams were unavailable."""
+DASH_MPD = "/tmp/yt_dash.mpd"
+
+
+def _read_head(url: str, n: int = 131072) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Range": f"bytes=0-{n - 1}"})
+    with urllib.request.urlopen(req, context=ssl._create_unverified_context(), timeout=20) as resp:
+        return resp.read()
+
+
+def _mp4_index(buf: bytes):
+    """(init_end, timescale, first_segment_offset, [(size, duration)]) from moov+sidx at the head of a DASH mp4, or None."""
+    pos, init_end, sidx = 0, 0, None
+    while pos + 8 <= len(buf):
+        size, typ = struct.unpack(">I4s", buf[pos:pos + 8])
+        hdr = 8
+        if size == 1:
+            size = struct.unpack(">Q", buf[pos + 8:pos + 16])[0]
+            hdr = 16
+        if size < hdr:
+            break
+        if typ == b"moov":
+            init_end = pos + size
+        elif typ == b"sidx":
+            body = buf[pos + hdr:pos + size]
+            timescale = struct.unpack(">I", body[8:12])[0]
+            if body[0] == 0:
+                first, off = struct.unpack(">I", body[16:20])[0], 20
+            else:
+                first, off = struct.unpack(">Q", body[20:28])[0], 28
+            count = struct.unpack(">H", body[off + 2:off + 4])[0]
+            off += 4
+            refs = []
+            for _ in range(count):
+                word, dur, _sap = struct.unpack(">III", body[off:off + 12])
+                if word >> 31:
+                    return None
+                refs.append((word & 0x7FFFFFFF, dur))
+                off += 12
+            sidx = (timescale, pos + size + first, refs)
+        elif typ in (b"moof", b"mdat"):
+            break
+        pos += size
+    if not init_end or not sidx or not sidx[2]:
+        return None
+    return (init_end,) + sidx
+
+
+def _segment_list(port: int, name: str, idx) -> str:
+    init_end, timescale, start, refs = idx
+    # dashdec seeks assuming equal-length segments, so give it the mean rather than the first.
+    mean = max(1, round(sum(d for _, d in refs) / len(refs)))
+    url = f"http://127.0.0.1:{port}/{name}"
+    rows = [f'<SegmentList timescale="{timescale}" duration="{mean}">',
+            f'<Initialization sourceURL="{url}" range="0-{init_end - 1}"/>']
+    off = start
+    for size, _dur in refs:
+        rows.append(f'<SegmentURL media="{url}" mediaRange="{off}-{off + size - 1}"/>')
+        off += size
+    rows.append("</SegmentList>")
+    return "\n".join(rows)
+
+
+def _dash_manifest(got: dict, ports, idx_v, idx_a) -> str:
+    v, a = got["video"], got["audio"]
+    dur = float(got["duration"])
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011" type="static" mediaPresentationDuration="PT{dur:.3f}S" minBufferTime="PT2S">
+<Period duration="PT{dur:.3f}S">
+<AdaptationSet id="0" contentType="video" mimeType="video/mp4" segmentAlignment="true" startWithSAP="1">
+<Representation id="v" bandwidth="{int((v.get('tbr') or 1500) * 1000)}" codecs="{v['vcodec']}" width="{v['width']}" height="{v['height']}" frameRate="{int(v.get('fps') or 25)}">
+{_segment_list(ports[0], 'v.mp4', idx_v)}
+</Representation>
+</AdaptationSet>
+<AdaptationSet id="1" contentType="audio" mimeType="audio/mp4" segmentAlignment="true" startWithSAP="1">
+<Representation id="a" bandwidth="{int((a.get('tbr') or 128) * 1000)}" codecs="{a['acodec']}" audioSamplingRate="{int(a.get('asr') or 44100)}">
+{_segment_list(ports[1], 'a.m4a', idx_a)}
+</Representation>
+</AdaptationSet>
+</Period>
+</MPD>
+"""
+
+
+def play_dash(video_id: str, height: int, ffplay_bin: str):
+    """Play separate video+audio via a local DASH manifest so ffplay can seek. None means unavailable."""
     got = extract_dash_streams(video_id, height)
     if not got:
         return None
-    v_url, a_url, title = got
-    servers, ff, prev_freq = [], None, None
+    title = got["title"]
+    servers, prev_freq = [], None
     try:
         ports = []
-        for u in (v_url, a_url):
-            srv = ThreadedHTTPServer(("127.0.0.1", find_free_port()), make_proxy_class(u))
+        for f in (got["video"], got["audio"]):
+            srv = ThreadedHTTPServer(("127.0.0.1", find_free_port()), make_proxy_class(f["url"]))
             threading.Thread(target=srv.serve_forever, daemon=True).start()
             servers.append(srv)
             ports.append(srv.server_address[1])
-        ff = subprocess.Popen(
-            [ffmpeg_bin, "-nostdin", "-hide_banner", "-loglevel", "error",
-             "-i", f"http://127.0.0.1:{ports[0]}/v.mp4", "-i", f"http://127.0.0.1:{ports[1]}/a.m4a",
-             "-map", "0:v:0", "-map", "1:a:0", "-c", "copy", "-flush_packets", "1", "-f", "matroska", "pipe:1"],
-            stdout=subprocess.PIPE)
+        idx_v = _mp4_index(_read_head(got["video"]["url"]))
+        idx_a = _mp4_index(_read_head(got["audio"]["url"]))
+        if not idx_v or not idx_a:
+            log("Khong doc duoc chi muc sidx cua luong DASH.")
+            return None
+        with open(DASH_MPD, "w", encoding="utf-8") as f:
+            f.write(_dash_manifest(got, ports, idx_v, idx_a))
         env = os.environ.copy()
         env["HOME"] = env.get("USERDATA_PATH") or env.get("HOME", "/root")
         # Same range Media Player.pak asks for; the launcher's default cap is too low for 720p software decode.
         prev_freq = _read_max_freq()
         _write_max_freq(2000000)
         subprocess.call("echo 1 > /tmp/stay_awake 2>/dev/null", shell=True)
-        cmd = _ffplay_cmd(ffplay_bin, title, "pipe:0")
+        cmd = _ffplay_cmd(ffplay_bin, title, DASH_MPD)
         log(f"Command: {' '.join(cmd)}")
         started = time.time()
-        res = subprocess.run(cmd, stdin=ff.stdout, env=env)
+        res = subprocess.run(cmd, env=env)
         log(f"ffplay exit code: {res.returncode}")
         if time.time() - started < 3:
             return None
         return res.returncode == 0
     except Exception as e:
-        record_error(f"Loi khi phat video {height}p: {e}")
-        return False
+        log(f"Loi khi phat video {height}p, quay lai 360p: {e}")
+        return None
     finally:
-        if ff:
-            ff.kill()
-            ff.wait()
         for s in servers:
             try:
                 s.shutdown()
@@ -406,7 +486,7 @@ def play_dash(video_id: str, height: int, ffplay_bin: str, ffmpeg_bin: str):
                 pass
         if prev_freq:
             _write_max_freq(prev_freq)
-        subprocess.call("rm -f /tmp/stay_awake 2>/dev/null", shell=True)
+        subprocess.call(f"rm -f /tmp/stay_awake {DASH_MPD} 2>/dev/null", shell=True)
 
 
 def play_video(video_id: str, direct_stream_url: str = None, direct_title: str = None,
@@ -423,9 +503,9 @@ def play_video(video_id: str, direct_stream_url: str = None, direct_title: str =
 
     quality = load_quality()
     if quality > 360 and not direct_stream_url and not audio_only and not resolve_retroarch_and_ffmpeg()[0]:
-        ffplay_bin, ffmpeg_bin = resolve_ffplay(), shutil.which("ffmpeg")
-        if ffplay_bin and ffmpeg_bin:
-            played = play_dash(video_id, quality, ffplay_bin, ffmpeg_bin)
+        ffplay_bin = resolve_ffplay()
+        if ffplay_bin:
+            played = play_dash(video_id, quality, ffplay_bin)
             if played is not None:
                 return played
             log(f"Khong co luong {quality}p, quay lai 360p.")
