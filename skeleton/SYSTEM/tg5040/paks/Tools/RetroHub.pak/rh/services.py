@@ -151,6 +151,57 @@ def _setusbconfig(mode):
 
 def _stop_mtp_quiet():
     subprocess.call("killall -9 MtpDaemon mtp-server >/dev/null 2>&1", shell=True)
+    time.sleep(0.2)
+    _unmount_mtp_override()
+
+
+MTP_PATCHED_COPY = "/tmp/MtpDaemon.sdcard"
+
+
+def _is_mounted(path):
+    try:
+        with open("/proc/mounts") as f:
+            return any(line.split()[1] == path for line in f)
+    except OSError:
+        return False
+
+
+def _unmount_mtp_override():
+    if _is_mounted(MTP_DAEMON):
+        if subprocess.call(["umount", MTP_DAEMON], stderr=subprocess.DEVNULL) != 0:
+            subprocess.call(["umount", "-l", MTP_DAEMON], stderr=subprocess.DEVNULL)
+    try:
+        os.remove(MTP_PATCHED_COPY)
+    except OSError:
+        pass
+
+
+def _override_mtp_storage_root():
+    """Make MtpDaemon expose the SD card without modifying any system file.
+
+    The stock binary hardcodes its one storage root, "/mnt/UDISK" (the 4 GB
+    internal flash), so the PC never sees the SD card. The string is followed by
+    NUL padding, so "/mnt/SDCARD" fits in place. A patched copy is kept in RAM
+    and bind-mounted over the binary: nothing on the rootfs changes, and
+    disabling MTP or rebooting restores the stock binary. Returns False only if
+    the binary is unrecognised.
+    """
+    old, new = b"/mnt/UDISK\0", b"/mnt/SDCARD\0"
+    try:
+        with open(MTP_DAEMON, "rb") as f:
+            data = f.read()
+        if new in data:
+            return True
+        off = data.find(old)
+        if off < 0 or data[off + len(old):off + len(new)] != b"\0" * (len(new) - len(old)):
+            return False
+        with open(MTP_PATCHED_COPY, "wb") as f:
+            f.write(data[:off] + new + data[off + len(new):])
+        os.chmod(MTP_PATCHED_COPY, 0o755)
+        return subprocess.call(["mount", "--bind", MTP_PATCHED_COPY, MTP_DAEMON],
+                               stderr=subprocess.DEVNULL) == 0
+    except OSError:
+        return False
 
 
 def _start_mtp_daemon():
@@ -188,6 +239,8 @@ def toggle_mtp():
         save_options(mtp_val="N")
         return "Đã tắt USB MTP Transfer" if vi else "Disabled USB MTP Transfer"
 
+    if SDCARD_PATH == "/mnt/SDCARD":
+        _override_mtp_storage_root()
     if not _start_mtp_daemon():
         _stop_mtp_quiet()
         save_options(mtp_val="N")
