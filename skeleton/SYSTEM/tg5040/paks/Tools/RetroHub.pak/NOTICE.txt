@@ -89,3 +89,13 @@ Rights holders wanting a title removed: nguyenxuanhoa493@gmail.com
   BSD 2-clause cho mot so phan. Toan van o bin/7zz-License.txt.
   Rang buoc unRAR: ma giai nen RAR khong duoc dung de dung lai bo NEN RAR.
   RetroHub chi goi 7zzs de GIAI NEN, khong nen gi ca.
+
+SFTPGo (payload/sftpgo_linux_arm64.tar.xz -> System/sftpgo/)
+  Copyright (C) 2019-2026 Nicola Murino
+  Phien ban 2.7.6, ban dung san cho Linux aarch64, khong sua doi.
+  Nguon / Source: https://github.com/drakkan/sftpgo/releases/tag/v2.7.6
+  sha256: 0d5c54a266515ae86a6a534e76c94807453353a1913ba3a26e81b9c20e548937
+  Giay phep / Licence: GNU AGPL-3.0 (toan van trong goi: LICENSE). Ma nguon
+  day du o URL tren. / Full licence text ships in the archive as LICENSE;
+  complete source at the URL above.
+  RetroHub giai nen goi nay khi nguoi dung bat SFTPGo lan dau.

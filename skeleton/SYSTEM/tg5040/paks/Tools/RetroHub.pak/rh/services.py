@@ -10,7 +10,7 @@ import json
 import threading
 import re
 
-from .paths import EX_OPTIONS_FILE, STREAMER_SCRIPT, GAMEWEB_SCRIPT
+from .paths import EX_OPTIONS_FILE, STREAMER_SCRIPT, GAMEWEB_SCRIPT, SDCARD_PATH, APP_DIR
 from .secrets import get_telegram_token
 from . import state
 from .sysinfo import (get_ip, is_sftpgo_running, is_ssh_running,
@@ -29,6 +29,43 @@ def save_options(sftpgo_val=None, ssh_val=None, adb_val=None, mtp_val=None):
     except Exception as e:
         print(f"Error saving options: {e}")
 
+SFTPGO_DIR = os.path.join(SDCARD_PATH, "System", "sftpgo")
+SFTPGO_BIN = os.path.join(SFTPGO_DIR, "sftpgo")
+SFTPGO_BOOTSTRAP = os.path.join(SFTPGO_DIR, "bootstrap.json")
+SFTPGO_PAYLOAD = os.path.join(APP_DIR, "payload", "sftpgo_linux_arm64.tar.xz")
+# Only what `sftpgo serve` needs; the archive also holds man pages, completions, etc.
+_SFTPGO_MEMBERS = ["sftpgo", "sftpgo.json", "static", "templates", "openapi", "LICENSE", "NOTICE"]
+
+
+def _install_sftpgo():
+    """Unpack the bundled SFTPGo release into SFTPGO_DIR. Returns True when the binary is usable."""
+    if os.access(SFTPGO_BIN, os.X_OK):
+        return True
+    if not os.path.isfile(SFTPGO_PAYLOAD):
+        return False
+    tmp = SFTPGO_DIR + ".tmp"
+    try:
+        shutil.rmtree(tmp, ignore_errors=True)
+        os.makedirs(tmp)
+        if subprocess.call(["tar", "xJf", SFTPGO_PAYLOAD, "-C", tmp] + _SFTPGO_MEMBERS,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0:
+            return False
+        os.makedirs(SFTPGO_DIR, exist_ok=True)
+        for name in _SFTPGO_MEMBERS:
+            src, dst = os.path.join(tmp, name), os.path.join(SFTPGO_DIR, name)
+            if name == "sftpgo.json" and os.path.exists(dst):
+                continue  # keep the user's config
+            if os.path.isdir(dst):
+                shutil.rmtree(dst)
+            shutil.move(src, dst)
+        os.chmod(SFTPGO_BIN, 0o755)
+        return True
+    except OSError:
+        return False
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def toggle_sftpgo():
     if is_sftpgo_running():
         subprocess.call("killall -9 sftpgo 2>/dev/null", shell=True)
@@ -39,15 +76,36 @@ def toggle_sftpgo():
         else:
             return "Không thể dừng SFTPGo!" if state.current_lang == "VI" else "Failed to stop SFTPGo!"
     else:
-        subprocess.call("mkdir -p /opt/sftpgo && /mnt/SDCARD/System/sftpgo/sftpgo serve -c /mnt/SDCARD/System/sftpgo/ >/dev/null 2>&1 &", shell=True)
-        time.sleep(0.8)
+        vi = state.current_lang == "VI"
+        if not _install_sftpgo():
+            save_options(sftpgo_val="N")
+            return (f"Không cài được SFTPGo (thiếu {SFTPGO_PAYLOAD})" if vi
+                    else f"Could not install SFTPGo (check {SFTPGO_PAYLOAD})")
+        args = [SFTPGO_BIN, "serve", "-c", SFTPGO_DIR]
+        # First run only: seed the login shown in the guide (trimui / trimui).
+        if not os.path.exists(os.path.join(SFTPGO_DIR, "sftpgo.db")):
+            try:
+                with open(SFTPGO_BOOTSTRAP, "w", encoding="utf-8") as f:
+                    json.dump({
+                        "admins": [{"username": "trimui", "password": "trimui", "status": 1,
+                                    "permissions": ["*"]}],
+                        "users": [{"username": "trimui", "password": "trimui", "status": 1,
+                                   "home_dir": "/mnt/SDCARD", "permissions": {"/": ["*"]}}]}, f)
+                args += ["--loaddata-from", SFTPGO_BOOTSTRAP, "--loaddata-mode", "1"]
+            except OSError:
+                pass
+        env = dict(os.environ, SFTPGO_LOG_LEVEL="warn")
+        subprocess.Popen(args, env=env, cwd=SFTPGO_DIR, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+        time.sleep(1.5)
         if is_sftpgo_running():
             save_options(sftpgo_val="Y")
             ip = get_ip()
-            return f"Đã bật SFTPGo (Web: http://{ip}:8080 | Port: 2022)" if state.current_lang == "VI" else f"Enabled SFTPGo (Web: http://{ip}:8080 | Port: 2022)"
+            return f"Đã bật SFTPGo (Web: http://{ip}:8080 | Port: 2022)" if vi else f"Enabled SFTPGo (Web: http://{ip}:8080 | Port: 2022)"
         else:
             save_options(sftpgo_val="N")
-            return "Không thể khởi động SFTPGo! Kiểm tra tệp thực thi." if state.current_lang == "VI" else "Failed to start SFTPGo! Check binary."
+            return "Không thể khởi động SFTPGo! Kiểm tra tệp thực thi." if vi else "Failed to start SFTPGo! Check binary."
 
 def toggle_ssh():
     if is_ssh_running():
