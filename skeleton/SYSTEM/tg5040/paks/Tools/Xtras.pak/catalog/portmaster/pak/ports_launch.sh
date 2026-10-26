@@ -167,10 +167,10 @@ main() {
     trap "cleanup" EXIT INT TERM HUP QUIT
     bind_audio_routing
 
-    # Set performance mode for ports (set max before min to avoid min > max rejection)
-    echo performance >/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+    # schedutil scales up to 2 GHz under load and idles low (set max before min to avoid min > max rejection)
+    echo schedutil >/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
     echo 2000000 >/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq
-    echo 2000000 >/sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq
+    echo 1008000 >/sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq
 
     mkdir -p "$PORTS_DIR"
 

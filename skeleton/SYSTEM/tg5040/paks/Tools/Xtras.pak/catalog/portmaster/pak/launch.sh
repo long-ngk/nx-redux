@@ -76,9 +76,9 @@ if [ "$PATCH_ONLY" = 0 ]; then
             echo 2160000 > /sys/devices/system/cpu/cpu4/cpufreq/scaling_max_freq 2>/dev/null
             ;;
         *)
-            echo performance > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null
+            echo schedutil > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null
             echo 2000000 > /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq 2>/dev/null
-            echo 2000000 > /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq 2>/dev/null
+            echo 1008000 > /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq 2>/dev/null
             ;;
     esac
 fi
