@@ -80,15 +80,71 @@ def toggle_adb():
         save_options(adb_val="Y")
         return "Đã bật USB ADB Debug (Mở cổng 5037)" if state.current_lang == "VI" else "Enabled USB ADB Debug (Opened port 5037)"
 
+MTP_DAEMON = "/usr/sbin/MtpDaemon"
+SETUSBCONFIG = "/bin/setusbconfig"
+
+
+def _setusbconfig(mode):
+    if not os.path.exists(SETUSBCONFIG):
+        return False
+    return subprocess.call([SETUSBCONFIG, mode], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL) == 0
+
+
+def _stop_mtp_quiet():
+    subprocess.call("killall -9 MtpDaemon mtp-server >/dev/null 2>&1", shell=True)
+
+
+def _start_mtp_daemon():
+    # /etc/init.d/mtp is not a valid rc.common script on this firmware, so its
+    # `start` is a no-op; run the daemon directly instead.
+    if not os.path.exists(MTP_DAEMON):
+        return False
+    subprocess.Popen([MTP_DAEMON, "-D"], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+    for _ in range(10):
+        time.sleep(0.3)
+        if is_mtp_running():
+            return True
+    return False
+
+
+def _usb_configured():
+    # Read only /sys/class/udc: the usbc0/usb_host|usb_device nodes switch the port role.
+    try:
+        for name in os.listdir("/sys/class/udc"):
+            with open(f"/sys/class/udc/{name}/state") as f:
+                if f.read().strip() == "configured":
+                    return True
+    except OSError:
+        pass
+    return False
+
+
 def toggle_mtp():
+    vi = state.current_lang == "VI"
     if is_mtp_running():
-        subprocess.call("/etc/init.d/mtp stop >/dev/null 2>&1; /etc/init.d/mtp disable >/dev/null 2>&1; killall -9 MtpDaemon >/dev/null 2>&1", shell=True)
+        _stop_mtp_quiet()
+        _setusbconfig("adb")
         save_options(mtp_val="N")
-        return "Đã tắt USB MTP Transfer" if state.current_lang == "VI" else "Disabled USB MTP Transfer"
-    else:
-        subprocess.call("/etc/init.d/mtp enable >/dev/null 2>&1; /etc/init.d/mtp start >/dev/null 2>&1 &", shell=True)
-        save_options(mtp_val="Y")
-        return "Đã bật USB MTP Transfer" if state.current_lang == "VI" else "Enabled USB MTP Transfer"
+        return "Đã tắt USB MTP Transfer" if vi else "Disabled USB MTP Transfer"
+
+    if not _start_mtp_daemon():
+        _stop_mtp_quiet()
+        save_options(mtp_val="N")
+        return "Không thể chạy MtpDaemon!" if vi else "Failed to start MtpDaemon!"
+    if not _setusbconfig("mtp"):
+        _stop_mtp_quiet()
+        _setusbconfig("adb")
+        save_options(mtp_val="N")
+        return "Không thể chuyển cổng USB sang MTP!" if vi else "Failed to switch USB gadget to MTP!"
+    save_options(mtp_val="Y")
+    # Not "configured" is normal when no PC is plugged in, so don't roll back.
+    if _usb_configured():
+        return "Đã bật USB MTP Transfer" if vi else "Enabled USB MTP Transfer"
+    return ("Đã bật USB MTP (hãy cắm cáp USB vào máy tính)" if vi
+            else "Enabled USB MTP (plug the USB cable into a PC)")
 
 # The streamer shells out to ffmpeg to encode frames. Without it the feature
 # cannot work at all, so it is hidden rather than offered and then failing.
